@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use byteorder::{ByteOrder, LittleEndian};
 use clap::{Parser, Subcommand};
 
@@ -10,7 +12,7 @@ const DEFAULT_PAYLOAD: usize = 1228;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about="IPv4 UDP heartbeat with Solana-like payload")]
+#[command(author, version, about="IPv4 UDP heartbeat with Solana-like payload (multi-server)")]
 struct Cli {
     #[command(subcommand)]
     mode: Mode,
@@ -18,31 +20,47 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Mode {
-    /// UDP echo server
+    /// UDP echo server (IPv4)
     Server {
+        /// Bind address, e.g. 0.0.0.0:7071
         #[arg(long, default_value = "0.0.0.0:7071")]
         bind: String,
     },
-    /// UDP heartbeat client
+    /// UDP heartbeat client (IPv4)
     Client {
+        /// Comma-separated server list (1 or 2), e.g. host1:7071,host2:7072
         #[arg(long)]
         server: String,
+
+        /// Local bind (optional), e.g. 0.0.0.0:0
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: String,
+
+        /// Send interval (milliseconds)
         #[arg(long, default_value = "500")]
         interval_ms: u64,
+
+        /// Read timeout per tick (milliseconds)
         #[arg(long, default_value = "1500")]
         timeout_ms: u64,
+
+        /// Alarm if RTT above this (milliseconds) for all servers in the tick
         #[arg(long = "rtt-alarm", default_value = "800")]
         rtt_alarm_ms: u64,
+
+        /// Alarm on N consecutive full misses (no server responds)
         #[arg(long = "loss-alarm", default_value_t = 10)]
         loss_alarm: u64,
+
+        /// UDP payload size in bytes (default 1228)
         #[arg(long = "payload-size", default_value_t = DEFAULT_PAYLOAD)]
         payload_size: usize,
     },
 }
 
-// ---- Packet encode/decode --------------------------------------------------
+// -----------------------------------------------------------------------------
+// Packet encode/decode
+// -----------------------------------------------------------------------------
 
 fn now_unix_ns() -> i64 {
     SystemTime::now()
@@ -86,6 +104,10 @@ fn decode_packet(buf: &[u8]) -> Option<(u64, i64, String)> {
     Some((seq, send_ns, host))
 }
 
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
 fn resolve_ipv4(addr: &str) -> Result<SocketAddr, String> {
     let addrs = addr
         .to_socket_addrs()
@@ -102,7 +124,9 @@ fn diff_ms(recv_ns: i64, send_ns: i64) -> f64 {
     (recv_ns - send_ns) as f64 / 1_000_000.0
 }
 
-// ---- Server ----------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Server
+// -----------------------------------------------------------------------------
 
 fn run_server(bind: &str) -> Result<(), String> {
     let bind_addr = resolve_ipv4(bind)?;
@@ -117,10 +141,12 @@ fn run_server(bind: &str) -> Result<(), String> {
     }
 }
 
-// ---- Client ----------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Client (multi-server)
+// -----------------------------------------------------------------------------
 
 fn run_client(
-    server: &str,
+    servers_csv: &str,
     bind: &str,
     interval: Duration,
     timeout: Duration,
@@ -134,12 +160,23 @@ fn run_client(
             HEADER_MIN, MAX_UDP_PAYLOAD
         ));
     }
-    let server_addr = resolve_ipv4(server)?;
-    let bind_addr = resolve_ipv4(bind)?;
 
+    // Parse 1 or 2 servers (comma separated)
+    let parts: Vec<&str> = servers_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return Err("provide 1 or 2 servers separated by a comma".into());
+    }
+
+    // Resolve to IPv4 socket addrs, preserving order for output
+    let mut servers: Vec<(String, SocketAddr)> = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let addr = resolve_ipv4(p)?;
+        servers.push((p.to_string(), addr));
+    }
+
+    // Bind local socket (unconnected; we use send_to/recv_from)
+    let bind_addr = resolve_ipv4(bind)?;
     let sock = UdpSocket::bind(bind_addr).map_err(|e| format!("bind {}: {}", bind_addr, e))?;
-    sock.connect(server_addr)
-        .map_err(|e| format!("connect {}: {}", server_addr, e))?;
     sock.set_read_timeout(Some(timeout))
         .map_err(|e| format!("set timeout: {}", e))?;
 
@@ -148,64 +185,116 @@ fn run_client(
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".to_string());
 
+    // Pretty print destinations
+    let pretty_dests = match servers.len() {
+        1 => format!("{}", servers[0].1),
+        2 => format!("{} & {}", servers[0].1, servers[1].1),
+        _ => unreachable!(),
+    };
+
     println!(
-        "[client] host={} -> {} interval={:?} timeout={:?} rtt_alarm={:?} loss_alarm={} payload={}B",
-        hostname, server_addr, interval, timeout, rtt_alarm, loss_alarm, payload
+        "[client] host={} -> {} interval={}ms timeout={}s rtt_alarm={}ms loss_alarm={} payload={}B",
+        hostname,
+        pretty_dests,
+        interval.as_millis(),
+        format!("{:.1}", timeout.as_secs_f64()),
+        rtt_alarm.as_millis(),
+        loss_alarm,
+        payload
     );
 
     let mut tx = vec![0u8; payload];
     let mut rx = vec![0u8; 65535];
     let mut seq: u64 = 0;
-    let mut consec_loss: u64 = 0;
+    let mut consec_full_miss: u64 = 0;
 
     loop {
         seq += 1;
 
-        // send
+        // 1) Send to all servers
         let n = encode_packet(&mut tx, &hostname, seq);
-        if let Err(e) = sock.send(&tx[..n]) {
-            eprintln!("[send-error] seq={} err={}", seq, e);
-            consec_loss += 1;
-            continue;
+        for (_, addr) in &servers {
+            if let Err(e) = sock.send_to(&tx[..n], addr) {
+                eprintln!("[send-error] seq={} dst={} err={}", seq, addr, e);
+            }
         }
 
-        match sock.recv(&mut rx) {
-            Ok(nr) => {
-                if let Some((rseq, send_ns, rhost)) = decode_packet(&rx[..nr]) {
-                    if rseq != seq {
-                        eprintln!("[corrupt] expected seq={} got={}", seq, rseq);
-                        consec_loss += 1;
-                    } else {
-                        let rtt_ms = diff_ms(now_unix_ns(), send_ns);
-                        consec_loss = 0;
-                        if rtt_ms > rtt_alarm.as_secs_f64() * 1000.0 {
-                            println!(
-                                "[ok] seq={} rtt_ms={:.2} host={} ALARM_RTT",
-                                seq, rtt_ms, rhost
-                            );
-                        } else {
-                            println!("[ok] seq={} rtt_ms={:.2} host={}", seq, rtt_ms, rhost);
+        // 2) Collect replies until we either have them all, or we hit timeout
+        let mut rtt_map: HashMap<SocketAddr, f64> = HashMap::new();
+        let deadline = std::time::Instant::now() + timeout;
+
+        while std::time::Instant::now() < deadline && rtt_map.len() < servers.len() {
+            match sock.recv_from(&mut rx) {
+                Ok((nr, src)) => {
+                    // Only care about our known servers
+                    if !servers.iter().any(|(_, a)| *a == src) {
+                        continue;
+                    }
+                    if let Some((rseq, send_ns, _rhost)) = decode_packet(&rx[..nr]) {
+                        if rseq != seq {
+                            continue; // stale/other seq
+                        }
+                        if !rtt_map.contains_key(&src) {
+                            let rtt_ms = diff_ms(now_unix_ns(), send_ns);
+                            rtt_map.insert(src, rtt_ms);
                         }
                     }
-                } else {
-                    eprintln!("[corrupt] decode failed for seq={}", seq);
-                    consec_loss += 1;
                 }
+                Err(_) => break, // timed out waiting
             }
-            Err(_) => {
-                eprintln!("[loss] seq={} timeout after {:?}", seq, timeout);
-                consec_loss += 1;
-                if loss_alarm > 0 && consec_loss >= loss_alarm {
-                    println!("[ALARM_LOSS] consec_lost={}", consec_loss);
+        }
+
+        // 3) Build outputs in same order as servers
+        let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
+        let mut all_bad = true;   // false if ANY reply is <= rtt_alarm
+        let mut all_missed = true; // true only if NONE replied
+
+        for (_, addr) in &servers {
+            if let Some(ms) = rtt_map.get(addr) {
+                rtts.push(Some(*ms));
+                all_missed = false;
+                if *ms <= rtt_alarm.as_secs_f64() * 1000.0 {
+                    all_bad = false;
                 }
+            } else {
+                rtts.push(None); // timeout
             }
+        }
+
+        // 4) Update full-miss counter & alarms
+        if all_missed {
+            consec_full_miss += 1;
+            eprintln!("[loss] seq={} timeout after {:?}", seq, timeout);
+            if loss_alarm > 0 && consec_full_miss >= loss_alarm {
+                println!("[ALARM_LOSS] consec_lost={}", consec_full_miss);
+            }
+        } else {
+            consec_full_miss = 0; // any reply resets
+        }
+
+        // 5) Print per-seq line (ordered RTTs, timeout if missing)
+        let rtt_str = rtts
+            .iter()
+            .map(|opt| match opt {
+                Some(v) => format!("{:.2}", v),
+                None => "timeout".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        if all_bad {
+            println!("[ok] seq={} rtt_ms={} host={} ALARM_RTT", seq, rtt_str, hostname);
+        } else {
+            println!("[ok] seq={} rtt_ms={} host={}", seq, rtt_str, hostname);
         }
 
         std::thread::sleep(interval);
     }
 }
 
-// ---- main ------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
 
 fn main() {
     let cli = Cli::parse();
