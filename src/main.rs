@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,12 +16,6 @@ const MAX_UDP_PAYLOAD: usize = 65_507;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about="IPv4 UDP heartbeat with Solana-like payload (multi-server)")]
-struct Cli {
-    #[command(subcommand)]
-    mode: Mode,
-}
-
-#[derive(Subcommand, Debug)]
 enum Mode {
     /// UDP echo server (IPv4)
     Server {
@@ -56,7 +52,18 @@ enum Mode {
         /// UDP payload size in bytes (default 1228)
         #[arg(long = "payload-size", default_value_t = DEFAULT_PAYLOAD)]
         payload_size: usize,
+
+        /// Optional log file path; if set, all output is appended there
+        #[arg(long)]
+        log: Option<String>,
     },
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about="Solana heartbeat (IPv4, multi-server, tab output)")]
+struct Cli {
+    #[command(subcommand)]
+    mode: Mode,
 }
 
 // -----------------------------------------------------------------------------
@@ -79,28 +86,18 @@ fn encode_packet(buf: &mut [u8], hostname: &str, seq: u64) -> usize {
     LittleEndian::write_i64(&mut buf[16..24], now_unix_ns());
     LittleEndian::write_u16(&mut buf[24..26], host_len as u16);
     buf[26..26 + host_len].copy_from_slice(&host_bytes[..host_len]);
-    for b in &mut buf[26 + host_len..] {
-        *b = 0;
-    }
+    for b in &mut buf[26 + host_len..] { *b = 0; }
     buf.len()
 }
 
 fn decode_packet(buf: &[u8]) -> Option<(u64, i64, String)> {
-    if buf.len() < HEADER_MIN {
-        return None;
-    }
-    if LittleEndian::read_u32(&buf[0..4]) != MAGIC {
-        return None;
-    }
-    if LittleEndian::read_u32(&buf[4..8]) != VERSION {
-        return None;
-    }
+    if buf.len() < HEADER_MIN { return None; }
+    if LittleEndian::read_u32(&buf[0..4]) != MAGIC { return None; }
+    if LittleEndian::read_u32(&buf[4..8]) != VERSION { return None; }
     let seq = LittleEndian::read_u64(&buf[8..16]);
     let send_ns = LittleEndian::read_i64(&buf[16..24]);
     let host_len = LittleEndian::read_u16(&buf[24..26]) as usize;
-    if HEADER_MIN + host_len > buf.len() {
-        return None;
-    }
+    if HEADER_MIN + host_len > buf.len() { return None; }
     let host = String::from_utf8_lossy(&buf[26..26 + host_len]).to_string();
     Some((seq, send_ns, host))
 }
@@ -114,15 +111,36 @@ fn resolve_ipv4(addr: &str) -> Result<SocketAddr, String> {
         .to_socket_addrs()
         .map_err(|e| format!("resolve {}: {}", addr, e))?;
     for a in addrs {
-        if a.is_ipv4() {
-            return Ok(a);
-        }
+        if a.is_ipv4() { return Ok(a); }
     }
     Err(format!("no IPv4 address found for {}", addr))
 }
 
 fn diff_ms(recv_ns: i64, send_ns: i64) -> f64 {
     (recv_ns - send_ns) as f64 / 1_000_000.0
+}
+
+fn ts_now() -> String {
+    // Example: 2025-09-21 15:13:03.521033811 GMT+00
+    Utc::now().format("%Y-%m-%d %H:%M:%S%.f GMT+00").to_string()
+}
+
+// unified output writer (file if provided; otherwise stdout/stderr)
+fn out_line(w: &mut Option<BufWriter<File>>, line: &str) {
+    if let Some(writer) = w {
+        let _ = writeln!(writer, "{}", line);
+        let _ = writer.flush();
+    } else {
+        println!("{}", line);
+    }
+}
+fn err_line(w: &mut Option<BufWriter<File>>, line: &str) {
+    if let Some(writer) = w {
+        let _ = writeln!(writer, "{}", line);
+        let _ = writer.flush();
+    } else {
+        eprintln!("{}", line);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -143,7 +161,7 @@ fn run_server(bind: &str) -> Result<(), String> {
 }
 
 // -----------------------------------------------------------------------------
-// Client (multi-server)
+// Client (multi-server, tab-delimited output, optional file logging)
 // -----------------------------------------------------------------------------
 
 fn run_client(
@@ -154,16 +172,18 @@ fn run_client(
     rtt_alarm: Duration,
     loss_alarm: u64,
     payload: usize,
+    log_path: Option<String>,
 ) -> Result<(), String> {
     if payload < HEADER_MIN || payload > MAX_UDP_PAYLOAD {
-        return Err(format!(
-            "payload-size must be between {} and {}",
-            HEADER_MIN, MAX_UDP_PAYLOAD
-        ));
+        return Err(format!("payload-size must be between {} and {}", HEADER_MIN, MAX_UDP_PAYLOAD));
     }
 
     // Parse 1 or 2 servers (comma separated)
-    let parts: Vec<&str> = servers_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = servers_csv
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     if parts.is_empty() || parts.len() > 2 {
         return Err("provide 1 or 2 servers separated by a comma".into());
     }
@@ -186,22 +206,38 @@ fn run_client(
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".to_string());
 
-    // Pretty print destinations
+    // Optional log file
+    let mut writer: Option<BufWriter<File>> = if let Some(path) = log_path {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open log file {}: {}", path, e))?;
+        Some(BufWriter::new(file))
+    } else {
+        None
+    };
+
+    // Pretty print destinations (header stays space-formatted as you requested)
     let pretty_dests = match servers.len() {
         1 => format!("{}", servers[0].1),
         2 => format!("{} & {}", servers[0].1, servers[1].1),
         _ => unreachable!(),
     };
 
-    println!(
-        "[client] host={} -> {} interval={}ms timeout={}s rtt_alarm={}ms loss_alarm={} payload={}B",
-        hostname,
-        pretty_dests,
-        interval.as_millis(),
-        format!("{:.1}", timeout.as_secs_f64()),
-        rtt_alarm.as_millis(),
-        loss_alarm,
-        payload
+    // Header line (unchanged format; written to file if --log is set)
+    out_line(
+        &mut writer,
+        &format!(
+            "[client] host={} -> {} interval={}ms timeout={}s rtt_alarm={}ms loss_alarm={} payload={}B",
+            hostname,
+            pretty_dests,
+            interval.as_millis(),
+            format!("{:.1}", timeout.as_secs_f64()),
+            rtt_alarm.as_millis(),
+            loss_alarm,
+            payload
+        ),
     );
 
     let mut tx = vec![0u8; payload];
@@ -216,7 +252,10 @@ fn run_client(
         let n = encode_packet(&mut tx, &hostname, seq);
         for (_, addr) in &servers {
             if let Err(e) = sock.send_to(&tx[..n], addr) {
-                eprintln!("[send-error] seq={} dst={} err={}", seq, addr, e);
+                err_line(
+                    &mut writer,
+                    &format!("[send-error]\t{}\thost={}\tdst={}\terr={}", ts_now(), hostname, addr, e),
+                );
             }
         }
 
@@ -227,36 +266,29 @@ fn run_client(
         while std::time::Instant::now() < deadline && rtt_map.len() < servers.len() {
             match sock.recv_from(&mut rx) {
                 Ok((nr, src)) => {
-                    // Only care about our known servers
-                    if !servers.iter().any(|(_, a)| *a == src) {
-                        continue;
-                    }
+                    if !servers.iter().any(|(_, a)| *a == src) { continue; }
                     if let Some((rseq, send_ns, _rhost)) = decode_packet(&rx[..nr]) {
-                        if rseq != seq {
-                            continue; // stale/other seq
-                        }
+                        if rseq != seq { continue; } // stale/other seq
                         if !rtt_map.contains_key(&src) {
                             let rtt_ms = diff_ms(now_unix_ns(), send_ns);
                             rtt_map.insert(src, rtt_ms);
                         }
                     }
                 }
-                Err(_) => break, // timed out waiting
+                Err(_) => break, // timed out waiting; evaluate what we got so far
             }
         }
 
         // 3) Build outputs in same order as servers
         let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
-        let mut all_bad = true;   // false if ANY reply is <= rtt_alarm
+        let mut all_bad = true;    // false if ANY reply is <= rtt_alarm
         let mut all_missed = true; // true only if NONE replied
 
         for (_, addr) in &servers {
             if let Some(ms) = rtt_map.get(addr) {
                 rtts.push(Some(*ms));
                 all_missed = false;
-                if *ms <= rtt_alarm.as_secs_f64() * 1000.0 {
-                    all_bad = false;
-                }
+                if *ms <= rtt_alarm.as_secs_f64() * 1000.0 { all_bad = false; }
             } else {
                 rtts.push(None); // timeout
             }
@@ -265,16 +297,21 @@ fn run_client(
         // 4) Update full-miss counter & alarms
         if all_missed {
             consec_full_miss += 1;
-            eprintln!("[loss] seq={} timeout after {:?}", seq, timeout);
+            err_line(
+                &mut writer,
+                &format!("[loss]\t{}\thost={}\ttimeout after {:?}", ts_now(), hostname, timeout),
+            );
             if loss_alarm > 0 && consec_full_miss >= loss_alarm {
-                let ts = Utc::now().format("%Y-%m-%d %H:%M:%S%.f GMT+00");
-                println!("[ALARM_LOSS]\t{}\thost={}\tconsec_lost={}", ts, hostname, consec_full_miss);
+                out_line(
+                    &mut writer,
+                    &format!("[ALARM_LOSS]\t{}\thost={}\tconsec_lost={}", ts_now(), hostname, consec_full_miss),
+                );
             }
         } else {
             consec_full_miss = 0; // any reply resets
         }
 
-        // 5) Print per-seq line (ordered RTTs, timeout if missing)      
+        // 5) Print per-tick OK line (tab-delimited; timestamp, host, rtt_ms)
         let rtt_str = rtts
             .iter()
             .map(|opt| match opt {
@@ -284,13 +321,16 @@ fn run_client(
             .collect::<Vec<_>>()
             .join(",");
 
-        // Current system timestamp in UTC with nanoseconds
-        let ts = Utc::now().format("%Y-%m-%d %H:%M:%S%.f GMT+00");
-
         if all_bad {
-            println!("[ok]\t{}\thost={}\trtt_ms={}\tALARM_RTT", ts, hostname, rtt_str);
+            out_line(
+                &mut writer,
+                &format!("[ok]\t{}\thost={}\trtt_ms={}\tALARM_RTT", ts_now(), hostname, rtt_str),
+            );
         } else {
-            println!("[ok]\t{}\thost={}\trtt_ms={}", ts, hostname, rtt_str);
+            out_line(
+                &mut writer,
+                &format!("[ok]\t{}\thost={}\trtt_ms={}", ts_now(), hostname, rtt_str),
+            );
         }
 
         std::thread::sleep(interval);
@@ -318,6 +358,7 @@ fn main() {
             rtt_alarm_ms,
             loss_alarm,
             payload_size,
+            log,
         } => {
             if let Err(e) = run_client(
                 &server,
@@ -327,6 +368,7 @@ fn main() {
                 Duration::from_millis(rtt_alarm_ms),
                 loss_alarm,
                 payload_size,
+                log,
             ) {
                 eprintln!("{}", e);
                 std::process::exit(1);
