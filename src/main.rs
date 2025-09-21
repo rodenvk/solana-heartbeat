@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use byteorder::{ByteOrder, LittleEndian};
 use clap::{Parser, Subcommand};
+use chrono::Utc;
 
 const MAGIC: u32 = 0x534C_5550; // 'SLUP'
 const VERSION: u32 = 1;
@@ -266,13 +267,14 @@ fn run_client(
             consec_full_miss += 1;
             eprintln!("[loss] seq={} timeout after {:?}", seq, timeout);
             if loss_alarm > 0 && consec_full_miss >= loss_alarm {
-                println!("[ALARM_LOSS] consec_lost={}", consec_full_miss);
+                let ts = Utc::now().format("%Y-%m-%d %H:%M:%S%.f GMT+00");
+                println!("[ALARM_LOSS]\t{}\thost={}\tconsec_lost={}", ts, hostname, consec_full_miss);
             }
         } else {
             consec_full_miss = 0; // any reply resets
         }
 
-        // 5) Print per-seq line (ordered RTTs, timeout if missing)
+        // 5) Print per-seq line (ordered RTTs, timeout if missing)      
         let rtt_str = rtts
             .iter()
             .map(|opt| match opt {
@@ -282,10 +284,13 @@ fn run_client(
             .collect::<Vec<_>>()
             .join(",");
 
+        // Current system timestamp in UTC with nanoseconds
+        let ts = Utc::now().format("%Y-%m-%d %H:%M:%S%.f GMT+00");
+
         if all_bad {
-            println!("[ok] seq={} rtt_ms={} host={} ALARM_RTT", seq, rtt_str, hostname);
+            println!("[ok]\t{}\thost={}\trtt_ms={}\tALARM_RTT", ts, hostname, rtt_str);
         } else {
-            println!("[ok] seq={} rtt_ms={} host={}", seq, rtt_str, hostname);
+            println!("[ok]\t{}\thost={}\trtt_ms={}", ts, hostname, rtt_str);
         }
 
         std::thread::sleep(interval);
