@@ -5,7 +5,6 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use byteorder::{ByteOrder, LittleEndian};
-use clap::{Parser, Subcommand};
 use chrono::Utc;
 
 const MAGIC: u32 = 0x534C_5550; // 'SLUP'
