@@ -1,0 +1,10 @@
+[package]
+name = "solana-heartbeat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+hostname = "0.4"
+byteorder = "1.5"
+humantime = "2.1"
