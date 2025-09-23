@@ -218,14 +218,14 @@ fn run_client(
         None
     };
 
-    // Pretty print destinations (header stays space-formatted as you requested)
+    // Pretty print destinations (header stays space-formatted as requested)
     let pretty_dests = match servers.len() {
         1 => format!("{}", servers[0].1),
         2 => format!("{} & {}", servers[0].1, servers[1].1),
         _ => unreachable!(),
     };
 
-    // Header line (unchanged format; written to file if --log is set)
+    // Header line (written to file if --log is set)
     out_line(
         &mut writer,
         &format!(
@@ -244,6 +244,9 @@ fn run_client(
     let mut rx = vec![0u8; 65535];
     let mut seq: u64 = 0;
     let mut consec_full_miss: u64 = 0;
+
+    // Track previous RTT per server (ms), aligned with `servers` order
+    let mut prev_rtts: Vec<Option<f64>> = vec![None; servers.len()];
 
     loop {
         seq += 1;
@@ -294,7 +297,7 @@ fn run_client(
             }
         }
 
-        // 4) Update full-miss counter & alarms
+        // 4) Update full-miss counter & detailed loss line
         if all_missed {
             consec_full_miss += 1;
             err_line(
@@ -311,7 +314,29 @@ fn run_client(
             consec_full_miss = 0; // any reply resets
         }
 
-        // 5) Print per-tick OK line (tab-delimited; timestamp, host, rtt_ms)
+        // 5) Decide consolidated status: [ok] / [warn] / [loss]
+        // Partial timeout (one but not both) OR any server's RTT jumped >= 50% vs its own previous
+        let partial_timeout = !all_missed && rtts.iter().any(|o| o.is_none());
+
+        let mut warn_due_to_rtt = false;
+        for i in 0..servers.len() {
+            if let (Some(prev), Some(curr)) = (prev_rtts[i], rtts[i]) {
+                if curr >= prev * 1.5 {
+                    warn_due_to_rtt = true;
+                    break;
+                }
+            }
+        }
+
+        let status_label = if all_missed {
+            "[loss]"
+        } else if partial_timeout || warn_due_to_rtt {
+            "[warn]"
+        } else {
+            "[ok]"
+        };
+
+        // 6) Print per-tick consolidated line (tab-delimited; timestamp, host, rtt_ms)
         let rtt_str = rtts
             .iter()
             .map(|opt| match opt {
@@ -324,14 +349,17 @@ fn run_client(
         if all_bad {
             out_line(
                 &mut writer,
-                &format!("[ok]\t{}\thost={}\trtt_ms={}\tALARM_RTT", ts_now(), hostname, rtt_str),
+                &format!("{}\t{}\thost={}\trtt_ms={}\tALARM_RTT", status_label, ts_now(), hostname, rtt_str),
             );
         } else {
             out_line(
                 &mut writer,
-                &format!("[ok]\t{}\thost={}\trtt_ms={}", ts_now(), hostname, rtt_str),
+                &format!("{}\t{}\thost={}\trtt_ms={}", status_label, ts_now(), hostname, rtt_str),
             );
         }
+
+        // 7) Update previous RTTs for next comparison (per server)
+        prev_rtts = rtts.clone();
 
         std::thread::sleep(interval);
     }
