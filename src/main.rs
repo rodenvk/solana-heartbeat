@@ -13,6 +13,7 @@ const VERSION: u32 = 1;
 const HEADER_MIN: usize = 26;
 const DEFAULT_PAYLOAD: usize = 1228;
 const MAX_UDP_PAYLOAD: usize = 65_507;
+const PROBE_SAMPLES: usize = 10; // baseline window size
 
 #[derive(Parser, Debug)]
 #[command(author, version, about="IPv4 UDP heartbeat with Solana-like payload (multi-server)")]
@@ -245,8 +246,10 @@ fn run_client(
     let mut seq: u64 = 0;
     let mut consec_full_miss: u64 = 0;
 
-    // Track previous RTT per server (ms), aligned with `servers` order
-    let mut prev_rtts: Vec<Option<f64>> = vec![None; servers.len()];
+    // Baseline state (per server)
+    let mut base_sum: Vec<f64> = vec![0.0; servers.len()];
+    let mut base_cnt: Vec<usize> = vec![0; servers.len()];
+    let mut base_avg: Vec<Option<f64>> = vec![None; servers.len()];
 
     loop {
         seq += 1;
@@ -297,7 +300,22 @@ fn run_client(
             }
         }
 
-        // 4) Update full-miss counter & detailed loss line
+        // 4) Update baselines (first PROBE_SAMPLES successful RTTs per server)
+        for i in 0..servers.len() {
+            if base_avg[i].is_none() {
+                if let Some(curr) = rtts[i] {
+                    if base_cnt[i] < PROBE_SAMPLES {
+                        base_sum[i] += curr;
+                        base_cnt[i] += 1;
+                        if base_cnt[i] == PROBE_SAMPLES {
+                            base_avg[i] = Some(base_sum[i] / base_cnt[i] as f64);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5) Full-miss handling
         if all_missed {
             consec_full_miss += 1;
             err_line(
@@ -314,29 +332,52 @@ fn run_client(
             consec_full_miss = 0; // any reply resets
         }
 
-        // 5) Decide consolidated status: [ok] / [warn] / [loss]
-        // Partial timeout (one but not both) OR any server's RTT jumped >= 50% vs its own previous
-        let partial_timeout = !all_missed && rtts.iter().any(|o| o.is_none());
-
-        let mut warn_due_to_rtt = false;
-        for i in 0..servers.len() {
-            if let (Some(prev), Some(curr)) = (prev_rtts[i], rtts[i]) {
-                if curr >= prev * 1.5 {
-                    warn_due_to_rtt = true;
-                    break;
-                }
-            }
-        }
-
+        // 6) Decide consolidated status: [ok] / [warn] / [loss]
+        // Loss already handled above—also reflect it in the consolidated label.
         let status_label = if all_missed {
             "[loss]"
-        } else if partial_timeout || warn_due_to_rtt {
-            "[warn]"
         } else {
-            "[ok]"
+            // Partial-timeout policy:
+            // - If exactly one timeout:
+            //     * [warn] ONLY if the other present RTT >= 1.5x its baseline (when baseline ready)
+            //     * Else [ok]
+            let timeouts = rtts.iter().filter(|o| o.is_none()).count();
+            if timeouts == 1 {
+                let mut warn_pt = false;
+                for i in 0..servers.len() {
+                    if rtts[i].is_some() {
+                        if let (Some(avg), Some(curr)) = (base_avg[i], rtts[i]) {
+                            if curr >= avg * 1.5 {
+                                warn_pt = true;
+                            }
+                        }
+                        break; // only one present in partial-timeout case
+                    }
+                }
+                if warn_pt { "[warn]" } else { "[ok]" }
+            } else {
+                // No timeouts (or both present)
+                // Baseline-based warn:
+                // - 1 server: curr >= 1.5x baseline
+                // - 2 servers: all curr present AND each >= 1.5x its baseline
+                let warn_due_to_baseline = if servers.len() == 1 {
+                    if let (Some(avg), Some(curr)) = (base_avg[0], rtts[0]) {
+                        curr >= avg * 1.5
+                    } else { false }
+                } else {
+                    let mut ready = true;
+                    for i in 0..servers.len() {
+                        if base_avg[i].is_none() || rtts[i].is_none() { ready = false; break; }
+                    }
+                    if ready {
+                        (0..servers.len()).all(|i| rtts[i].unwrap() >= base_avg[i].unwrap() * 1.5)
+                    } else { false }
+                };
+                if warn_due_to_baseline { "[warn]" } else { "[ok]" }
+            }
         };
 
-        // 6) Print per-tick consolidated line (tab-delimited; timestamp, host, rtt_ms)
+        // 7) Print per-tick consolidated line (tab-delimited; timestamp, host, rtt_ms)
         let rtt_str = rtts
             .iter()
             .map(|opt| match opt {
@@ -357,9 +398,6 @@ fn run_client(
                 &format!("{}\t{}\thost={}\trtt_ms={}", status_label, ts_now(), hostname, rtt_str),
             );
         }
-
-        // 7) Update previous RTTs for next comparison (per server)
-        prev_rtts = rtts.clone();
 
         std::thread::sleep(interval);
     }
