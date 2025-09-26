@@ -46,7 +46,7 @@ enum Mode {
         #[arg(long = "rtt-alarm", default_value = "800")]
         rtt_alarm_ms: u64,
 
-        /// Alarm on N consecutive full misses (no server responds)
+        /// Trigger ALARM_LOSS after N consecutive ALARM_RTT ticks
         #[arg(long = "loss-alarm", default_value_t = 10)]
         loss_alarm: u64,
 
@@ -244,12 +244,14 @@ fn run_client(
     let mut tx = vec![0u8; payload];
     let mut rx = vec![0u8; 65535];
     let mut seq: u64 = 0;
-    let mut consec_full_miss: u64 = 0;
 
     // Baseline state (per server)
     let mut base_sum: Vec<f64> = vec![0.0; servers.len()];
     let mut base_cnt: Vec<usize> = vec![0; servers.len()];
     let mut base_avg: Vec<Option<f64>> = vec![None; servers.len()];
+
+    // NEW: Count consecutive ALARM_RTT ticks (all_bad == true)
+    let mut consec_alarm_rtt: u64 = 0;
 
     loop {
         seq += 1;
@@ -287,7 +289,7 @@ fn run_client(
 
         // 3) Build outputs in same order as servers
         let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
-        let mut all_bad = true;    // false if ANY reply is <= rtt_alarm
+        let mut all_bad = true;    // becomes false if ANY reply is <= rtt_alarm
         let mut all_missed = true; // true only if NONE replied
 
         for (_, addr) in &servers {
@@ -296,7 +298,7 @@ fn run_client(
                 all_missed = false;
                 if *ms <= rtt_alarm.as_secs_f64() * 1000.0 { all_bad = false; }
             } else {
-                rtts.push(None); // timeout
+                rtts.push(None); // timeout counts as "bad" for ALARM_RTT purposes
             }
         }
 
@@ -315,14 +317,7 @@ fn run_client(
             }
         }
 
-        // 5) Maintain full-miss counter (no immediate print here)
-        if all_missed {
-            consec_full_miss += 1;
-        } else {
-            consec_full_miss = 0;
-        }
-
-        // 6) Decide consolidated status: [ok] / [warn] / [loss]
+        // 5) Decide consolidated status: [ok] / [warn] / [loss]
         let status_label = if all_missed {
             "[loss]"
         } else {
@@ -366,21 +361,29 @@ fn run_client(
             }
         };
 
-        // 7) Build alarm suffixes for this consolidated line
+        // 6) Build alarm suffixes and maintain ALARM_RTT consecutive counter
         // - ALARM_RTT if "all_bad" (all replies above --rtt-alarm or timeouts)
-        // - ALARM_LOSS if we are currently in full-loss and consecutive counter >= threshold
+        // - ALARM_LOSS if ALARM_RTT has held for --loss-alarm consecutive ticks
         let mut alarm_suffixes: Vec<&str> = Vec::new();
-        if all_bad { alarm_suffixes.push("ALARM_RTT"); }
-        if all_missed && loss_alarm > 0 && consec_full_miss >= loss_alarm {
+
+        if all_bad {
+            alarm_suffixes.push("ALARM_RTT");
+            consec_alarm_rtt += 1;
+        } else {
+            consec_alarm_rtt = 0;
+        }
+
+        if loss_alarm > 0 && consec_alarm_rtt >= loss_alarm {
             alarm_suffixes.push("ALARM_LOSS");
         }
+
         let alarm_str = if alarm_suffixes.is_empty() {
             String::new()
         } else {
             format!("\t{}", alarm_suffixes.join(" "))
         };
 
-        // 8) Print per-tick consolidated line (tab-delimited; timestamp, host, rtt_ms, alarms)
+        // 7) Print per-tick consolidated line (tab-delimited; timestamp, host, rtt_ms, alarms)
         let rtt_str = rtts
             .iter()
             .map(|opt| match opt {
