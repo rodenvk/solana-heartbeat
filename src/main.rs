@@ -281,7 +281,7 @@ fn run_client(
                         }
                     }
                 }
-                Err(_) => break, // timed out waiting; evaluate what we got so far
+                Err(_) => break, // timed out waiting
             }
         }
 
@@ -315,25 +315,14 @@ fn run_client(
             }
         }
 
-        // 5) Full-miss handling
+        // 5) Maintain full-miss counter (no immediate print here)
         if all_missed {
             consec_full_miss += 1;
-            err_line(
-                &mut writer,
-                &format!("[loss]\t{}\thost={}\ttimeout after {:?}", ts_now(), hostname, timeout),
-            );
-            if loss_alarm > 0 && consec_full_miss >= loss_alarm {
-                out_line(
-                    &mut writer,
-                    &format!("[ALARM_LOSS]\t{}\thost={}\tconsec_lost={}", ts_now(), hostname, consec_full_miss),
-                );
-            }
         } else {
-            consec_full_miss = 0; // any reply resets
+            consec_full_miss = 0;
         }
 
         // 6) Decide consolidated status: [ok] / [warn] / [loss]
-        // Loss already handled above—also reflect it in the consolidated label.
         let status_label = if all_missed {
             "[loss]"
         } else {
@@ -377,7 +366,21 @@ fn run_client(
             }
         };
 
-        // 7) Print per-tick consolidated line (tab-delimited; timestamp, host, rtt_ms)
+        // 7) Build alarm suffixes for this consolidated line
+        // - ALARM_RTT if "all_bad" (all replies above --rtt-alarm or timeouts)
+        // - ALARM_LOSS if we are currently in full-loss and consecutive counter >= threshold
+        let mut alarm_suffixes: Vec<&str> = Vec::new();
+        if all_bad { alarm_suffixes.push("ALARM_RTT"); }
+        if all_missed && loss_alarm > 0 && consec_full_miss >= loss_alarm {
+            alarm_suffixes.push("ALARM_LOSS");
+        }
+        let alarm_str = if alarm_suffixes.is_empty() {
+            String::new()
+        } else {
+            format!("\t{}", alarm_suffixes.join(" "))
+        };
+
+        // 8) Print per-tick consolidated line (tab-delimited; timestamp, host, rtt_ms, alarms)
         let rtt_str = rtts
             .iter()
             .map(|opt| match opt {
@@ -387,17 +390,10 @@ fn run_client(
             .collect::<Vec<_>>()
             .join(",");
 
-        if all_bad {
-            out_line(
-                &mut writer,
-                &format!("{}\t{}\thost={}\trtt_ms={}\tALARM_RTT", status_label, ts_now(), hostname, rtt_str),
-            );
-        } else {
-            out_line(
-                &mut writer,
-                &format!("{}\t{}\thost={}\trtt_ms={}", status_label, ts_now(), hostname, rtt_str),
-            );
-        }
+        out_line(
+            &mut writer,
+            &format!("{}\t{}\thost={}\trtt_ms={}{}", status_label, ts_now(), hostname, rtt_str, alarm_str),
+        );
 
         std::thread::sleep(interval);
     }
