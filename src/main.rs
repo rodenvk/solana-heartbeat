@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Write, Read};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -10,10 +11,9 @@ use clap::Parser;
 use chrono::Utc;
 
 const MAGIC: u32 = 0x534C_5550; // 'SLUP'
-const VERSION: u32 = 2;         // v2 adds role string to packet
-// Layout: magic(4) ver(4) seq(8) send_ns(8) host_len(2) host[..] role_len(2) role[..] + padding
-const HEADER_BASE: usize = 4 + 4 + 8 + 8 + 2; // 26 before role_len
-const HEADER_MIN: usize = HEADER_BASE + 2;    // + role_len
+const VERSION: u32 = 3;         // v3 adds client+version strings to the packet
+// v3 layout: magic(4) ver(4) seq(8) send_ns(8) host_len(2) host[..] role_len(2) role[..] client_len(2) client[..] ver_len(2) ver[..] + padding
+const HEADER_MIN: usize = 4 + 4 + 8 + 8 + 2 + 2 + 2 + 2; // minimal header with empty strings
 const DEFAULT_PAYLOAD: usize = 1228;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 const PROBE_SAMPLES: usize = 10; // baseline window size
@@ -87,11 +87,11 @@ enum Mode {
         #[arg(long)]
         log: Option<String>,
 
-        /// Validator identity pubkey used to locate tower file (optional but recommended)
+        /// Validator identity pubkey (optional; still supported)
         #[arg(long)]
         pubkey: Option<String>,
 
-        /// Ledger directory containing tower-*.bin files (optional but recommended)
+        /// Ledger directory (optional; still supported)
         #[arg(long)]
         ledger: Option<String>,
     },
@@ -105,7 +105,7 @@ struct Cli {
 }
 
 // -----------------------------------------------------------------------------
-// Packet encode/decode (v2 includes role string)
+// Packet encode/decode (v3)
 // -----------------------------------------------------------------------------
 
 fn now_unix_ns() -> i64 {
@@ -115,54 +115,71 @@ fn now_unix_ns() -> i64 {
         .as_nanos() as i128 as i64
 }
 
-fn encode_packet(buf: &mut [u8], hostname: &str, role: &str, seq: u64) -> usize {
-    let host_bytes = hostname.as_bytes();
-    let host_len = host_bytes.len().min(255);
-    let role_bytes = role.as_bytes();
-    let role_len = role_bytes.len().min(255);
+fn put_str(buf: &mut [u8], off: &mut usize, s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(65535);
+    LittleEndian::write_u16(&mut buf[*off..*off + 2], len as u16);
+    *off += 2;
+    let end = *off + len;
+    if end <= buf.len() {
+        buf[*off..end].copy_from_slice(&bytes[..len]);
+    }
+    *off = end;
+}
 
-    LittleEndian::write_u32(&mut buf[0..4], MAGIC);
-    LittleEndian::write_u32(&mut buf[4..8], VERSION);
-    LittleEndian::write_u64(&mut buf[8..16], seq);
-    LittleEndian::write_i64(&mut buf[16..24], now_unix_ns());
-    LittleEndian::write_u16(&mut buf[24..26], host_len as u16);
-    let mut off = 26;
-    buf[off..off + host_len].copy_from_slice(&host_bytes[..host_len]);
-    off += host_len;
+fn get_str<'a>(buf: &'a [u8], off: &mut usize) -> Option<&'a str> {
+    if *off + 2 > buf.len() { return None; }
+    let len = LittleEndian::read_u16(&buf[*off..*off + 2]) as usize;
+    *off += 2;
+    if *off + len > buf.len() { return None; }
+    let s = std::str::from_utf8(&buf[*off..*off + len]).ok()?;
+    *off += len;
+    Some(s)
+}
 
-    LittleEndian::write_u16(&mut buf[off..off + 2], role_len as u16);
-    off += 2;
-    buf[off..off + role_len].copy_from_slice(&role_bytes[..role_len]);
-    off += role_len;
+fn encode_packet(
+    buf: &mut [u8],
+    hostname: &str,
+    client: &str,
+    version: &str,
+    role: &str,
+    seq: u64,
+) -> usize {
+    let mut off = 0;
+    LittleEndian::write_u32(&mut buf[off..off + 4], MAGIC); off += 4;
+    LittleEndian::write_u32(&mut buf[off..off + 4], VERSION); off += 4;
+    LittleEndian::write_u64(&mut buf[off..off + 8], seq); off += 8;
+    LittleEndian::write_i64(&mut buf[off..off + 8], now_unix_ns()); off += 8;
 
-    // zero padding remainder
+    put_str(buf, &mut off, hostname);
+    put_str(buf, &mut off, client);
+    put_str(buf, &mut off, version);
+    put_str(buf, &mut off, role);
+
     for b in &mut buf[off..] { *b = 0; }
     buf.len()
 }
 
-fn decode_packet(buf: &[u8]) -> Option<(u64, i64, String, String)> {
+fn decode_packet(buf: &[u8]) -> Option<(u64, i64, String, String, String, String)> {
     if buf.len() < HEADER_MIN { return None; }
-    if LittleEndian::read_u32(&buf[0..4]) != MAGIC { return None; }
-    if LittleEndian::read_u32(&buf[4..8]) != VERSION { return None; }
-    let seq = LittleEndian::read_u64(&buf[8..16]);
-    let send_ns = LittleEndian::read_i64(&buf[16..24]);
+    let mut off = 0;
+    if LittleEndian::read_u32(&buf[off..off + 4]) != MAGIC { return None; }
+    off += 4;
+    if LittleEndian::read_u32(&buf[off..off + 4]) != VERSION { return None; }
+    off += 4;
+    let seq = LittleEndian::read_u64(&buf[off..off + 8]); off += 8;
+    let send_ns = LittleEndian::read_i64(&buf[off..off + 8]); off += 8;
 
-    let host_len = LittleEndian::read_u16(&buf[24..26]) as usize;
-    let mut off = 26;
-    if off + host_len + 2 > buf.len() { return None; }
-    let host = String::from_utf8_lossy(&buf[off..off + host_len]).to_string();
-    off += host_len;
+    let host = get_str(buf, &mut off)?.to_string();
+    let client = get_str(buf, &mut off)?.to_string();
+    let ver = get_str(buf, &mut off)?.to_string();
+    let role = get_str(buf, &mut off)?.to_string();
 
-    let role_len = LittleEndian::read_u16(&buf[off..off + 2]) as usize;
-    off += 2;
-    if off + role_len > buf.len() { return None; }
-    let role = String::from_utf8_lossy(&buf[off..off + role_len]).to_string();
-
-    Some((seq, send_ns, host, role))
+    Some((seq, send_ns, host, client, ver, role))
 }
 
 // -----------------------------------------------------------------------------
-// Shared helpers
+// Helpers
 // -----------------------------------------------------------------------------
 
 fn resolve_ipv4(addr: &str) -> Result<SocketAddr, String> {
@@ -200,7 +217,7 @@ fn err_line(w: &mut Option<BufWriter<File>>, line: &str) {
     }
 }
 
-// --- role detection on client (tower file) ---
+// role detection via tower file path (unchanged helpers from your codebase)
 
 fn find_latest_tower(ledger_dir: &Path, pubkey: &str) -> Option<PathBuf> {
     let needle = format!("-{}.bin", pubkey);
@@ -230,8 +247,109 @@ fn role_from_tower(ledger: Option<&str>, pubkey: Option<&str>) -> &'static str {
     let Some(tower_path) = find_latest_tower(p, pk) else { return "backup"; };
     let Ok(meta) = std::fs::metadata(&tower_path) else { return "backup"; };
     let Ok(mtime) = meta.modified() else { return "backup"; };
-    let Ok(age) = SystemTime::now().duration_since(mtime) else { return "master"; }; // future mtime => fresh
+    let Ok(age) = SystemTime::now().duration_since(mtime) else { return "master"; };
     if age <= MASTER_WINDOW { "master" } else { "backup" }
+}
+
+// -----------------------------------------------------------------------------
+// Validator client/version detection (search for running processes)
+// -----------------------------------------------------------------------------
+
+fn read_cmdline(pid: &str) -> Option<Vec<String>> {
+    let path = format!("/proc/{}/cmdline", pid);
+    let mut f = File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let parts = buf
+        .split(|b| *b == 0)
+        .filter_map(|s| if s.is_empty() { None } else { Some(String::from_utf8_lossy(s).to_string()) })
+        .collect::<Vec<_>>();
+    if parts.is_empty() { None } else { Some(parts) }
+}
+
+fn list_processes() -> Vec<(String, Vec<String>)> {
+    let mut v = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let pid = match name.to_str() { Some(s) => s, None => continue };
+            if !pid.chars().all(|c| c.is_ascii_digit()) { continue; }
+            if let Some(cmd) = read_cmdline(pid) {
+                v.push((pid.to_string(), cmd));
+            }
+        }
+    }
+    v
+}
+
+fn exe_of(pid: &str) -> Option<String> {
+    let p = format!("/proc/{}/exe", pid);
+    std::fs::read_link(p).ok().and_then(|pb| pb.to_str().map(|s| s.to_string()))
+}
+
+fn run_version(cmd: &str, arg: &str) -> Option<String> {
+    let out = Command::new(cmd).arg(arg).output().ok()?;
+    if !out.status.success() { return None; }
+    let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        s = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    }
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn detect_client_and_version() -> (String, String) {
+    // Scan /proc for a running agave validator or fdctl and invoke its exe
+    let procs = list_processes();
+    // Searching for running agave-validator process
+    for (pid, cmd) in &procs {
+        if cmd.iter().any(|p| p.contains("agave-validator") || p.contains("solana-validator")) {
+            if let Some(exe) = exe_of(pid) {
+                if let Some(s) = run_version(&exe, "--version") {
+                    return parse_agave_version(&s);
+                }
+                // If --version fails, still claim Agave w/ unknown version
+                return ("Agave".to_string(), "unknown".to_string());
+            }
+        }
+    }
+    // Then Firedancer process
+    for (pid, cmd) in &procs {
+        if cmd.iter().any(|p| p.contains("fdctl")) {
+            if let Some(exe) = exe_of(pid) {
+                if let Some(s) = run_version(&exe, "--version") {
+                    return parse_fd_version(&s);
+                }
+                return ("Firedancer".to_string(), "unknown".to_string());
+            }
+        }
+    }
+
+    ("not running".to_string(), "unknown".to_string())
+}
+
+fn parse_agave_version(s: &str) -> (String, String) {
+    // Typical: "agave-validator 3.0.4 (src:...; feat:..., client:Agave)"
+    let mut client = "agave-validator".to_string();
+    let mut version = "unknown".to_string();
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() >= 2 {
+        version = parts[1].to_string();
+    }
+    if let Some(idx) = s.find("client:") {
+        let tail = &s[idx + 7..];
+        if let Some(end) = tail.find(|c| c == ')' || c == ',' ) {
+            client = tail[..end].trim().to_string();
+        } else {
+            client = tail.trim().trim_end_matches(')').to_string();
+        }
+    }
+    (client, version)
+}
+
+fn parse_fd_version(s: &str) -> (String, String) {
+    // Typical: "0.708.20306 (40a70de...)"
+    let version = s.split_whitespace().next().unwrap_or("unknown").to_string();
+    ("Firedancer".to_string(), version)
 }
 
 // -----------------------------------------------------------------------------
@@ -245,6 +363,8 @@ struct HostState {
     base_avg: Option<f64>,
     consec_alarm_rtt: u64,
     last_seen: Option<std::time::Instant>,
+    last_client: String,
+    last_version: String,
     last_role: String,
 }
 
@@ -281,9 +401,11 @@ fn run_server_monitored(
         match sock.recv_from(&mut buf) {
             Ok((n, peer)) => {
                 let recv_ns = now_unix_ns();
-                if let Some((_seq, send_ns, host, role)) = decode_packet(&buf[..n]) {
+                if let Some((_seq, send_ns, host, client, version, role)) = decode_packet(&buf[..n]) {
                     let st = states.entry(host.clone()).or_default();
                     st.last_seen = Some(std::time::Instant::now());
+                    st.last_client = client.clone();
+                    st.last_version = version.clone();
                     st.last_role = role.clone();
 
                     // one-way delay (approx) from client timestamp to server receive
@@ -332,8 +454,8 @@ fn run_server_monitored(
                     out_line(
                         &mut writer,
                         &format!(
-                            "{}\t{}\thost={}\trole={}\trtt_ms={:.2}{}",
-                            status_label, ts_now(), host, st.last_role, delay_ms, alarm_str
+                            "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={:.2}{}",
+                            status_label, ts_now(), host, st.last_client, st.last_version, st.last_role, delay_ms, alarm_str
                         ),
                     );
                 }
@@ -363,8 +485,8 @@ fn run_server_monitored(
                         out_line(
                             &mut writer,
                             &format!(
-                                "[loss]\t{}\thost={}\trole={}\trtt_ms=timeout{}",
-                                ts_now(), host, st.last_role, alarm_str
+                                "[loss]\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms=timeout{}",
+                                ts_now(), host, st.last_client, st.last_version, st.last_role, alarm_str
                             ),
                         );
                     }
@@ -448,22 +570,16 @@ fn run_client(
     out_line(
         &mut writer,
         &format!(
-            "[client] host={} -> {} interval={}ms timeout={}s rtt_alarm={}ms loss_alarm={} payload={}B{}{}",
+            "[client] host={} -> {} interval={}ms timeout={}s rtt_alarm={}ms loss_alarm={} payload={}B",
             hostname,
             pretty_dests,
             interval.as_millis(),
             format!("{:.1}", timeout.as_secs_f64()),
             rtt_alarm.as_millis(),
             loss_alarm,
-            payload,
-            pubkey.as_ref().map(|s| format!(" pubkey={}", s)).unwrap_or_default(),
-            ledger.as_ref().map(|s| format!(" ledger={}", s)).unwrap_or_default(),
+            payload
         ),
     );
-
-    let mut tx = vec![0u8; payload];
-    let mut rx = vec![0u8; 65535];
-    let mut seq: u64 = 0;
 
     // Baselines per server
     let mut base_sum: Vec<f64> = vec![0.0; servers.len()];
@@ -473,14 +589,21 @@ fn run_client(
     // ALARM_LOSS is based on consecutive ALARM_RTT ticks
     let mut consec_alarm_rtt: u64 = 0;
 
+    let mut tx = vec![0u8; payload];
+    let mut rx = vec![0u8; 65535];
+    let mut seq: u64 = 0;
+
     loop {
         seq += 1;
 
-        // role (computed client-side each tick)
+        // role (computed each tick from tower file path and pubkey, if provided)
         let role = role_from_tower(ledger.as_deref(), pubkey.as_deref());
 
-        // 1) Send to all servers (packet includes hostname + role)
-        let n = encode_packet(&mut tx, &hostname, role, seq);
+        // client/version (robust detection: PATH or running process)
+        let (client_name, client_ver) = detect_client_and_version();
+
+        // 1) Send to all servers (packet includes hostname + role + client + version)
+        let n = encode_packet(&mut tx, &hostname, &client_name, &client_ver, role, seq);
         for (_, addr) in &servers {
             if let Err(e) = sock.send_to(&tx[..n], addr) {
                 err_line(
@@ -498,7 +621,7 @@ fn run_client(
             match sock.recv_from(&mut rx) {
                 Ok((nr, src)) => {
                     if !servers.iter().any(|(_, a)| *a == src) { continue; }
-                    if let Some((rseq, send_ns, _rhost, _rrole)) = decode_packet(&rx[..nr]) {
+                    if let Some((rseq, send_ns, _rhost, _rcli, _rver, _rrole)) = decode_packet(&rx[..nr]) {
                         if rseq != seq { continue; } // stale
                         if !rtt_map.contains_key(&src) {
                             let rtt_ms = diff_ms(now_unix_ns(), send_ns);
@@ -593,7 +716,7 @@ fn run_client(
             format!("\t{}", alarm_suffixes.join(" "))
         };
 
-        // 7) Print consolidated line
+        // 7) Print consolidated line (ORDER: host, client, version, role)
         let rtt_str = rtts
             .iter()
             .map(|opt| match opt {
@@ -606,8 +729,8 @@ fn run_client(
         out_line(
             &mut writer,
             &format!(
-                "{}\t{}\thost={}\trole={}\trtt_ms={}{}",
-                status_label, ts_now(), hostname, role, rtt_str, alarm_str
+                "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={}{}",
+                status_label, ts_now(), hostname, client_name, client_ver, role, rtt_str, alarm_str
             ),
         );
 
