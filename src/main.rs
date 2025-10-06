@@ -287,14 +287,32 @@ fn exe_of(pid: &str) -> Option<String> {
     std::fs::read_link(p).ok().and_then(|pb| pb.to_str().map(|s| s.to_string()))
 }
 
+// NOTE: capture stdout+stderr; some builds print to stderr or return non-zero.
 fn run_version(cmd: &str, arg: &str) -> Option<String> {
     let out = Command::new(cmd).arg(arg).output().ok()?;
-    if !out.status.success() { return None; }
-    let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        s = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    }
+    let mut s = String::new();
+    s.push_str(&String::from_utf8_lossy(&out.stdout));
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    let s = s.trim().to_string();
     if s.is_empty() { None } else { Some(s) }
+}
+
+// Extract first dotted numeric (e.g., 3.0.4 or 0.708.20306) from an arbitrary string.
+// No extra deps; simple state machine.
+fn first_dotted_version(s: &str) -> Option<String> {
+    let mut ver = String::new();
+    let mut seen_digit = false;
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            ver.push(ch);
+            seen_digit = true;
+        } else if ch == '.' && seen_digit {
+            ver.push(ch);
+        } else if seen_digit {
+            break;
+        }
+    }
+    if ver.contains('.') { Some(ver) } else { None }
 }
 
 fn detect_client_and_version() -> (String, String) {
@@ -302,13 +320,12 @@ fn detect_client_and_version() -> (String, String) {
     let procs = list_processes();
     // Searching for running agave-validator process
     for (pid, cmd) in &procs {
-        if cmd.iter().any(|p| p.contains("agave-validator") || p.contains("solana-validator")) {
+        if cmd.iter().any(|p| p.contains("agave-validator")) {
             if let Some(exe) = exe_of(pid) {
                 if let Some(s) = run_version(&exe, "--version") {
                     return parse_agave_version(&s);
                 }
-                // If --version fails, still claim Agave w/ unknown version
-                return ("Agave".to_string(), "unknown".to_string());
+                return ("agave-validator".to_string(), "unknown".to_string());
             }
         }
     }
@@ -323,32 +340,37 @@ fn detect_client_and_version() -> (String, String) {
             }
         }
     }
-
+    // 3) Nothing running
     ("not running".to_string(), "unknown".to_string())
 }
 
 fn parse_agave_version(s: &str) -> (String, String) {
-    // Typical: "agave-validator 3.0.4 (src:...; feat:..., client:Agave)"
+    // Keep your current default client label for minimal change.
     let mut client = "agave-validator".to_string();
-    let mut version = "unknown".to_string();
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() >= 2 {
-        version = parts[1].to_string();
-    }
+
+    // If the banner includes "client:XYZ", honor it.
     if let Some(idx) = s.find("client:") {
         let tail = &s[idx + 7..];
-        if let Some(end) = tail.find(|c| c == ')' || c == ',' ) {
-            client = tail[..end].trim().to_string();
+        if let Some(end) = tail.find(|c: char| c == ')' || c == ',' || c.is_whitespace()) {
+            let extracted = tail[..end].trim();
+            if !extracted.is_empty() {
+                client = extracted.to_string();
+            }
         } else {
-            client = tail.trim().trim_end_matches(')').to_string();
+            let extracted = tail.trim().trim_end_matches(')');
+            if !extracted.is_empty() {
+                client = extracted.to_string();
+            }
         }
     }
+
+    // Robustly extract dotted version anywhere in output
+    let version = first_dotted_version(s).unwrap_or_else(|| "unknown".to_string());
     (client, version)
 }
 
 fn parse_fd_version(s: &str) -> (String, String) {
-    // Typical: "0.708.20306 (40a70de...)"
-    let version = s.split_whitespace().next().unwrap_or("unknown").to_string();
+    let version = first_dotted_version(s).unwrap_or_else(|| "unknown".to_string());
     ("Firedancer".to_string(), version)
 }
 
