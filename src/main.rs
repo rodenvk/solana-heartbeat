@@ -420,21 +420,16 @@ fn run_server_monitored(
                         }
                     }
 
-                    // verdict (single incoming stream)
-                    let all_missed = false;
+                    // ALARM gate: RTT above threshold counts as an ALARM_RTT condition
                     let all_bad = delay_ms > rtt_alarm.as_secs_f64() * 1000.0;
 
+                    // Note: [loss] is emitted in the timeout sweep (no packet received within `timeout`).
+                    // When we *did* receive a packet, it's either [ok] or [warn] based on baseline.
                     let warn_due_to_baseline = match st.base_avg {
                         Some(avg) => delay_ms >= avg * 1.5,
-                        None => false,
+                        None => false, // baseline not ready => don't warn yet
                     };
-                    let status_label = if all_missed {
-                        "[loss]"
-                    } else if warn_due_to_baseline {
-                        "[warn]"
-                    } else {
-                        "[ok]"
-                    };
+                    let status_label = if warn_due_to_baseline { "[warn]" } else { "[ok]" };
 
                     // alarms (consecutive ALARM_RTT)
                     let mut alarm_suffixes: Vec<&str> = Vec::new();
