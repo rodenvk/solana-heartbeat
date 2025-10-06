@@ -666,36 +666,26 @@ fn run_client(
         // 5) Verdict label [ok]/[warn]/[loss]
         let status_label = if all_missed {
             "[loss]"
-        } else {
-            // partial-timeout policy
-            let timeouts = rtts.iter().filter(|o| o.is_none()).count();
-            if timeouts == 1 {
-                let mut warn_pt = false;
-                for i in 0..servers.len() {
-                    if rtts[i].is_some() {
-                        if let (Some(avg), Some(curr)) = (base_avg[i], rtts[i]) {
-                            if curr >= avg * 1.5 { warn_pt = true; }
-                        }
-                        break;
-                    }
-                }
-                if warn_pt { "[warn]" } else { "[ok]" }
+        } else if servers.len() == 1 {
+            // single-server logic unchanged
+            if let (Some(avg), Some(curr)) = (base_avg[0], rtts[0]) {
+                if curr >= avg * 1.5 { "[warn]" } else { "[ok]" }
             } else {
-                // no timeouts or both present
-                let warn_due_to_baseline = if servers.len() == 1 {
-                    if let (Some(avg), Some(curr)) = (base_avg[0], rtts[0]) {
-                        curr >= avg * 1.5
-                    } else { false }
-                } else {
-                    let mut ready = true;
-                    for i in 0..servers.len() {
-                        if base_avg[i].is_none() || rtts[i].is_none() { ready = false; break; }
-                    }
-                    if ready {
-                        (0..servers.len()).all(|i| rtts[i].unwrap() >= base_avg[i].unwrap() * 1.5)
-                    } else { false }
-                };
-                if warn_due_to_baseline { "[warn]" } else { "[ok]" }
+                "[ok]"
+            }
+        } else {
+            // multi-server logic: bads == 0 → ok, 1 → warn, >1 → loss
+            let bads = servers.iter().enumerate().filter(|(i, _)| {
+                match rtts[*i] {
+                    None => true, // timeout is bad
+                    Some(curr) => base_avg[*i].map_or(false, |avg| curr >= avg * 1.5),
+                }
+            }).count();
+
+            match bads {
+                0 => "[ok]",
+                1 => "[warn]",
+                _ => "[loss]",
             }
         };
 
