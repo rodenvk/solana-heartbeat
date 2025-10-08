@@ -4,7 +4,7 @@ use std::io::{BufWriter, Write, Read};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 
 use byteorder::{ByteOrder, LittleEndian};
 use clap::Parser;
@@ -554,8 +554,7 @@ fn run_client(
     // Bind local socket
     let bind_addr = resolve_ipv4(bind)?;
     let sock = UdpSocket::bind(bind_addr).map_err(|e| format!("bind {}: {}", bind_addr, e))?;
-    sock.set_read_timeout(Some(timeout))
-        .map_err(|e| format!("set timeout: {}", e))?;
+    sock.set_nonblocking(true).map_err(|e| format!("set nonblocking: {}", e))?;
 
     // Hostname (with optional override)
     let hostname = if let Some(hn) = hostname_override {
@@ -606,142 +605,163 @@ fn run_client(
     // ALARM_LOSS is based on consecutive ALARM_RTT ticks
     let mut consec_alarm_rtt: u64 = 0;
 
+    // tick context (recomputed each send)
+    let mut role: &'static str = "unknown";
+    let mut client_name = String::new();
+    let mut client_ver = String::new();
+
     let mut tx = vec![0u8; payload];
     let mut rx = vec![0u8; 65535];
     let mut seq: u64 = 0;
+    let mut current_rtts: HashMap<SocketAddr, f64> = HashMap::new(); // replies for current tick
+    let mut next_send = Instant::now();
 
     loop {
-        seq += 1;
+        let now = Instant::now();
 
-        // role (computed each tick from tower file path and pubkey, if provided)
-        let role = role_from_tower(ledger.as_deref(), pubkey.as_deref());
+        // 1) Finalize previous tick and send a new packet exactly on schedule
+        if now >= next_send {
+            // Finalize previous sequence's verdict/output (if any was sent already)
+            if seq > 0 {
+                // Build ordered RTT vector for the previous tick
+                let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
+                let mut all_bad = true;
+                let mut all_missed = true;
 
-        // client/version (robust detection: PATH or running process)
-        let (client_name, client_ver) = detect_client_and_version();
+                for (_, addr) in &servers {
+                    if let Some(ms) = current_rtts.get(addr) {
+                        rtts.push(Some(*ms));
+                        all_missed = false;
+                        if *ms <= rtt_alarm.as_secs_f64() * 1000.0 { all_bad = false; }
+                    } else {
+                        rtts.push(None);
+                    }
+                }
 
-        // 1) Send to all servers (packet includes hostname + role + client + version)
-        let n = encode_packet(&mut tx, &hostname, &client_name, &client_ver, role, seq);
-        for (_, addr) in &servers {
-            if let Err(e) = sock.send_to(&tx[..n], addr) {
-                err_line(
+                // Update baselines (first PROBE_SAMPLES successful RTTs per server)
+                for i in 0..servers.len() {
+                    if base_avg[i].is_none() {
+                        if let Some(curr) = rtts[i] {
+                            if base_cnt[i] < PROBE_SAMPLES {
+                                base_sum[i] += curr;
+                                base_cnt[i] += 1;
+                                if base_cnt[i] == PROBE_SAMPLES {
+                                    base_avg[i] = Some(base_sum[i] / base_cnt[i] as f64);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Verdict label [ok]/[warn]/[loss]
+                let status_label = if all_missed {
+                    "[loss]"
+                } else if servers.len() == 1 {
+                    if let (Some(avg), Some(curr)) = (base_avg[0], rtts[0]) {
+                        if curr >= avg * 1.5 { "[warn]" } else { "[ok]" }
+                    } else {
+                        "[ok]"
+                    }
+                } else {
+                    // Count "bad" servers: timeout OR (baseline ready AND rtt >= 1.5× baseline)
+                    let bads = servers.iter().enumerate().filter(|(i, _)| {
+                        match rtts[*i] {
+                            None => true, // timeout is bad
+                            Some(curr) => base_avg[*i].map_or(false, |avg| curr >= avg * 1.5),
+                        }
+                    }).count();
+
+                    match bads {
+                        0 => "[ok]",
+                        1 => "[warn]",
+                        _ => "[loss]",
+                    }
+                };
+
+                // Alarms (consecutive ALARM_RTT ticks)
+                let mut alarm_suffixes: Vec<&str> = Vec::new();
+                if all_bad {
+                    alarm_suffixes.push("ALARM_RTT");
+                    consec_alarm_rtt += 1;
+                } else {
+                    consec_alarm_rtt = 0;
+                }
+                if loss_alarm > 0 && consec_alarm_rtt >= loss_alarm {
+                    alarm_suffixes.push("ALARM_LOSS");
+                }
+                let alarm_str = if alarm_suffixes.is_empty() {
+                    String::new()
+                } else {
+                    format!("\t{}", alarm_suffixes.join(" "))
+                };
+
+                // Print consolidated line for the previous tick
+                let rtt_str = rtts
+                    .iter()
+                    .map(|opt| match opt {
+                        Some(v) => format!("{:.2}", v),
+                        None => "timeout".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                out_line(
                     &mut writer,
-                    &format!("[send-error]\t{}\thost={}\tdst={}\terr={}", ts_now(), hostname, addr, e),
+                    &format!(
+                        "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={}{}",
+                        status_label, ts_now(), hostname, client_name, client_ver, role, rtt_str, alarm_str
+                    ),
                 );
+            }
+
+            // Prepare NEXT tick and send
+            seq += 1;
+            role = role_from_tower(ledger.as_deref(), pubkey.as_deref());
+            let (cn, cv) = detect_client_and_version();
+            client_name = cn;
+            client_ver = cv;
+
+            let n = encode_packet(&mut tx, &hostname, role, &client_name, &client_ver, seq);
+            for (_, addr) in &servers {
+                if let Err(e) = sock.send_to(&tx[..n], addr) {
+                    err_line(
+                        &mut writer,
+                        &format!("[send-error]\t{}\thost={}\tdst={}\terr={}", ts_now(), hostname, addr, e),
+                    );
+                }
+            }
+            current_rtts.clear();
+
+            // Maintain a steady cadence (avoid drift if we were late)
+            next_send += interval;
+            if Instant::now() > next_send + interval {
+                next_send = Instant::now() + interval;
             }
         }
 
-        // 2) Collect replies until all or timeout
-        let mut rtt_map: HashMap<SocketAddr, f64> = HashMap::new();
-        let deadline = std::time::Instant::now() + timeout;
-
-        while std::time::Instant::now() < deadline && rtt_map.len() < servers.len() {
+        // 2) Drain any available replies (non-blocking)
+        loop {
             match sock.recv_from(&mut rx) {
                 Ok((nr, src)) => {
+                    // only from configured servers
                     if !servers.iter().any(|(_, a)| *a == src) { continue; }
-                    if let Some((rseq, send_ns, _rhost, _rcli, _rver, _rrole)) = decode_packet(&rx[..nr]) {
-                        if rseq != seq { continue; } // stale
-                        if !rtt_map.contains_key(&src) {
+                    if let Some((rseq, send_ns, _rhost, _rrole, _rcli, _rver)) = decode_packet(&rx[..nr]) {
+                        // count replies for the *current* sequence only; ignore late ones
+                        if rseq == seq && !current_rtts.contains_key(&src) {
                             let rtt_ms = diff_ms(now_unix_ns(), send_ns);
-                            rtt_map.insert(src, rtt_ms);
+                            current_rtts.insert(src, rtt_ms);
                         }
                     }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break; // nothing to read now
                 }
                 Err(_) => break,
             }
         }
 
-        // 3) Build outputs
-        let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
-        let mut all_bad = true;
-        let mut all_missed = true;
-
-        for (_, addr) in &servers {
-            if let Some(ms) = rtt_map.get(addr) {
-                rtts.push(Some(*ms));
-                all_missed = false;
-                if *ms <= rtt_alarm.as_secs_f64() * 1000.0 { all_bad = false; }
-            } else {
-                rtts.push(None);
-            }
-        }
-
-        // 4) Update baselines (first PROBE_SAMPLES successful RTTs per server)
-        for i in 0..servers.len() {
-            if base_avg[i].is_none() {
-                if let Some(curr) = rtts[i] {
-                    if base_cnt[i] < PROBE_SAMPLES {
-                        base_sum[i] += curr;
-                        base_cnt[i] += 1;
-                        if base_cnt[i] == PROBE_SAMPLES {
-                            base_avg[i] = Some(base_sum[i] / base_cnt[i] as f64);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5) Verdict label [ok]/[warn]/[loss]
-        let status_label = if all_missed {
-            "[loss]"
-        } else if servers.len() == 1 {
-            // single-server logic unchanged
-            if let (Some(avg), Some(curr)) = (base_avg[0], rtts[0]) {
-                if curr >= avg * 1.5 { "[warn]" } else { "[ok]" }
-            } else {
-                "[ok]"
-            }
-        } else {
-            // multi-server logic: bads == 0 → ok, 1 → warn, >1 → loss
-            let bads = servers.iter().enumerate().filter(|(i, _)| {
-                match rtts[*i] {
-                    None => true, // timeout is bad
-                    Some(curr) => base_avg[*i].map_or(false, |avg| curr >= avg * 1.5),
-                }
-            }).count();
-
-            match bads {
-                0 => "[ok]",
-                1 => "[warn]",
-                _ => "[loss]",
-            }
-        };
-
-        // 6) Alarms (consecutive ALARM_RTT)
-        let mut alarm_suffixes: Vec<&str> = Vec::new();
-        if all_bad {
-            alarm_suffixes.push("ALARM_RTT");
-            consec_alarm_rtt += 1;
-        } else {
-            consec_alarm_rtt = 0;
-        }
-        if loss_alarm > 0 && consec_alarm_rtt >= loss_alarm {
-            alarm_suffixes.push("ALARM_LOSS");
-        }
-        let alarm_str = if alarm_suffixes.is_empty() {
-            String::new()
-        } else {
-            format!("\t{}", alarm_suffixes.join(" "))
-        };
-
-        // 7) Print consolidated line (ORDER: host, client, version, role)
-        let rtt_str = rtts
-            .iter()
-            .map(|opt| match opt {
-                Some(v) => format!("{:.2}", v),
-                None => "timeout".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        out_line(
-            &mut writer,
-            &format!(
-                "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={}{}",
-                status_label, ts_now(), hostname, client_name, client_ver, role, rtt_str, alarm_str
-            ),
-        );
-
-        std::thread::sleep(interval);
+        // 3) Tiny sleep prevents a tight spin
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
