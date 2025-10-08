@@ -388,6 +388,11 @@ struct HostState {
     last_client: String,
     last_version: String,
     last_role: String,
+    // Learned receive interval (probe-based)
+    recv_interval_sum: std::time::Duration,        // sum of inter-arrival
+    recv_interval_cnt: usize,                      // # of samples
+    recv_interval_avg: Option<std::time::Duration>,// learned interval
+    next_due: Option<std::time::Instant>,         // next expected packet
 }
 
 fn run_server_monitored(
@@ -400,8 +405,7 @@ fn run_server_monitored(
 ) -> Result<(), String> {
     let bind_addr = resolve_ipv4(bind)?;
     let sock = UdpSocket::bind(bind_addr).map_err(|e| format!("bind {}: {}", bind_addr, e))?;
-    sock.set_read_timeout(Some(interval))
-        .map_err(|e| format!("set timeout: {}", e))?;
+    sock.set_nonblocking(true).map_err(|e| format!("set nonblocking: {}", e))?;
 
     let mut writer: Option<BufWriter<File>> = if let Some(path) = log_path {
         let file = OpenOptions::new().create(true).append(true).open(&path)
@@ -419,83 +423,124 @@ fn run_server_monitored(
     let mut states: HashMap<String, HostState> = HashMap::new();
     let mut buf = vec![0u8; 65535];
 
+    let check_period = interval / 4;                // e.g., 500ms interval -> check every 125ms
+    let mut next_check = std::time::Instant::now() + check_period;
     loop {
-        match sock.recv_from(&mut buf) {
-            Ok((n, peer)) => {
-                let recv_ns = now_unix_ns();
-                if let Some((_seq, send_ns, host, client, version, role)) = decode_packet(&buf[..n]) {
-                    let st = states.entry(host.clone()).or_default();
-                    st.last_seen = Some(std::time::Instant::now());
-                    st.last_client = client.clone();
-                    st.last_version = version.clone();
-                    st.last_role = role.clone();
+        // ---- Non-blocking drain of any incoming packets ----
+        loop {
+            match sock.recv_from(&mut buf) {
+                Ok((n, peer)) => {
+                    let recv_ns = now_unix_ns();
+                    if let Some((_seq, send_ns, host, client, version, role)) = decode_packet(&buf[..n]) {
+                        let st = states.entry(host.clone()).or_default();
 
-                    // one-way delay (approx) from client timestamp to server receive
-                    let delay_ms = diff_ms(recv_ns, send_ns);
+                        // ---- receive instant (monotonic) ----
+                        let recv_time = std::time::Instant::now();
 
-                    // baseline: first PROBE_SAMPLES successes
-                    if st.base_avg.is_none() && st.base_cnt < PROBE_SAMPLES {
-                        st.base_sum += delay_ms;
-                        st.base_cnt += 1;
-                        if st.base_cnt == PROBE_SAMPLES {
-                            st.base_avg = Some(st.base_sum / st.base_cnt as f64);
+                        // Learn per-host receive interval during probe (based on inter-arrival)
+                        if let Some(prev) = st.last_seen {
+                            let delta = recv_time.saturating_duration_since(prev);
+                            if st.recv_interval_avg.is_none() && st.recv_interval_cnt < PROBE_SAMPLES {
+                                st.recv_interval_sum += delta;
+                                st.recv_interval_cnt += 1;
+                                if st.recv_interval_cnt == PROBE_SAMPLES {
+                                    let avg = st.recv_interval_sum / st.recv_interval_cnt as u32;
+                                    st.recv_interval_avg = Some(avg);
+                                }
+                            }
                         }
+                        st.last_seen = Some(recv_time);
+
+                        // Maintain next_due using learned interval (fallback to configured interval)
+                        let learnt = st.recv_interval_avg.unwrap_or(interval);
+                        st.next_due = Some(recv_time + learnt);
+
+                        // Update last-known meta from packet
+                        st.last_client = client.clone();
+                        st.last_version = version.clone();
+                        st.last_role = role.clone();
+
+                        // one-way delay (approx) from client timestamp to server receive
+                        let mut delay_ms = diff_ms(recv_ns, send_ns);
+                        if delay_ms < 0.0 { delay_ms = 0.0; } // tiny guard
+
+                        // baseline: first PROBE_SAMPLES successes
+                        if st.base_avg.is_none() && st.base_cnt < PROBE_SAMPLES {
+                            st.base_sum += delay_ms;
+                            st.base_cnt += 1;
+                            if st.base_cnt == PROBE_SAMPLES {
+                                st.base_avg = Some(st.base_sum / st.base_cnt as f64);
+                            }
+                        }
+
+                        // ALARM gate: RTT above threshold counts as an ALARM_RTT condition
+                        let all_bad = delay_ms > rtt_alarm.as_secs_f64() * 1000.0;
+
+                        // When we *did* receive a packet, it's either [ok] or [warn] based on baseline.
+                        let warn_due_to_baseline = match st.base_avg {
+                            Some(avg) => delay_ms >= avg * 1.5,
+                            None => false, // baseline not ready => don't warn yet
+                        };
+                        let status_label = if warn_due_to_baseline { "[warn]" } else { "[ok]" };
+
+                        // alarms (consecutive ALARM_RTT)
+                        let mut alarm_suffixes: Vec<&str> = Vec::new();
+                        if all_bad {
+                            alarm_suffixes.push("ALARM_RTT");
+                            st.consec_alarm_rtt += 1;
+                        } else {
+                            st.consec_alarm_rtt = 0;
+                        }
+                        if loss_alarm > 0 && st.consec_alarm_rtt >= loss_alarm {
+                            alarm_suffixes.push("ALARM_LOSS");
+                        }
+                        let alarm_str = if alarm_suffixes.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\t{}", alarm_suffixes.join(" "))
+                        };
+
+                        out_line(
+                            &mut writer,
+                            &format!(
+                                "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={:.2}{}",
+                                status_label, ts_now(), host, st.last_client, st.last_version, st.last_role, delay_ms, alarm_str
+                            ),
+                        );
                     }
-
-                    // ALARM gate: RTT above threshold counts as an ALARM_RTT condition
-                    let all_bad = delay_ms > rtt_alarm.as_secs_f64() * 1000.0;
-
-                    // Note: [loss] is emitted in the timeout sweep (no packet received within `timeout`).
-                    // When we *did* receive a packet, it's either [ok] or [warn] based on baseline.
-                    let warn_due_to_baseline = match st.base_avg {
-                        Some(avg) => delay_ms >= avg * 1.5,
-                        None => false, // baseline not ready => don't warn yet
-                    };
-                    let status_label = if warn_due_to_baseline { "[warn]" } else { "[ok]" };
-
-                    // alarms (consecutive ALARM_RTT)
-                    let mut alarm_suffixes: Vec<&str> = Vec::new();
-                    if all_bad {
-                        alarm_suffixes.push("ALARM_RTT");
-                        st.consec_alarm_rtt += 1;
-                    } else {
-                        st.consec_alarm_rtt = 0;
-                    }
-                    if loss_alarm > 0 && st.consec_alarm_rtt >= loss_alarm {
-                        alarm_suffixes.push("ALARM_LOSS");
-                    }
-                    let alarm_str = if alarm_suffixes.is_empty() { String::new() } else {
-                        format!("\t{}", alarm_suffixes.join(" "))
-                    };
-
-                    out_line(
-                        &mut writer,
-                        &format!(
-                            "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={:.2}{}",
-                            status_label, ts_now(), host, st.last_client, st.last_version, st.last_role, delay_ms, alarm_str
-                        ),
-                    );
+                    // Echo packet back as before
+                    let _ = sock.send_to(&buf[..n], peer);
                 }
-                // Echo packet back as before
-                let _ = sock.send_to(&buf[..n], peer);
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // drained
+                Err(_) => break, // transient read error; ignore this round
             }
-            Err(_timeout) => {
-                // Emit [loss] for hosts not seen within 'timeout'
-                let now = std::time::Instant::now();
-                for (host, st) in states.iter_mut() {
-                    let overdue = match st.last_seen {
-                        Some(t) => now.duration_since(t) > timeout,
-                        None => true,
-                    };
-                    if overdue {
-                        // timeout -> ALARM_RTT true this tick
+        }
+
+        // ---- Periodic missed-tick check (runs even if traffic is arriving) ----
+        let now = std::time::Instant::now();
+        if now >= next_check {
+            for (host, st) in states.iter_mut() {
+                let learnt = st.recv_interval_avg.unwrap_or(interval);
+
+                // If we've never scheduled next_due but have a last_seen, initialize it
+                if st.next_due.is_none() {
+                    if let Some(prev) = st.last_seen {
+                        st.next_due = Some(prev + learnt);
+                    }
+                }
+
+                // Emit at most one [loss] per check to keep cadence near-real-time
+                if let Some(due) = st.next_due {
+                    if now >= due {
                         let mut alarm_suffixes: Vec<&str> = Vec::new();
                         alarm_suffixes.push("ALARM_RTT");
                         st.consec_alarm_rtt += 1;
                         if loss_alarm > 0 && st.consec_alarm_rtt >= loss_alarm {
                             alarm_suffixes.push("ALARM_LOSS");
                         }
-                        let alarm_str = if alarm_suffixes.is_empty() { String::new() } else {
+                        let alarm_str = if alarm_suffixes.is_empty() {
+                            String::new()
+                        } else {
                             format!("\t{}", alarm_suffixes.join(" "))
                         };
 
@@ -506,10 +551,22 @@ fn run_server_monitored(
                                 ts_now(), host, st.last_client, st.last_version, st.last_role, alarm_str
                             ),
                         );
+
+                        // advance exactly one tick; next check will emit the next one if still overdue
+                        st.next_due = Some(due + learnt);
                     }
                 }
             }
+
+            // schedule next check (and avoid drift on long pauses)
+            next_check += check_period;
+            if std::time::Instant::now() > next_check + check_period {
+                next_check = std::time::Instant::now() + check_period;
+            }
         }
+
+        // tiny sleep to avoid a hot loop
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
