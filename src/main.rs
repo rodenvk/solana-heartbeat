@@ -18,6 +18,9 @@ const DEFAULT_PAYLOAD: usize = 1228;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 const PROBE_SAMPLES: usize = 10; // baseline window size
 const MASTER_WINDOW: Duration = Duration::from_millis(500); // tower mtime freshness
+// Server-side grace thresholds
+const WARN_ABSOLUTE_DELAY_MS: f64 = 10.0;  // warn requires at least +10ms over baseline AND 1.5x baseline
+const LOSS_GRACE_DELAY_MS: u64 = 50;  // loss when elapsed >= interval + baseline + 50ms
 
 #[derive(Parser, Debug)]
 #[command(author, version, about="IPv4 UDP heartbeat with Solana-like payload (client/server; mirrored output)")]
@@ -476,9 +479,9 @@ fn run_server_monitored(
                         // ALARM gate: RTT above threshold counts as an ALARM_RTT condition
                         let all_bad = delay_ms > rtt_alarm.as_secs_f64() * 1000.0;
 
-                        // When we *did* receive a packet, it's either [ok] or [warn] based on baseline.
+                        // When we *did* receive a packet, it's either [ok] or [warn] that requires BOTH an absolute bump (+10ms) AND ≥ 1.5× baseline
                         let warn_due_to_baseline = match st.base_avg {
-                            Some(avg) => delay_ms >= avg * 1.5,
+                            Some(avg) => (delay_ms - avg) >= WARN_ABSOLUTE_DELAY_MS && delay_ms >= avg * 1.5,
                             None => false, // baseline not ready => don't warn yet
                         };
                         let status_label = if warn_due_to_baseline { "[warn]" } else { "[ok]" };
@@ -529,9 +532,15 @@ fn run_server_monitored(
                     }
                 }
 
-                // Emit at most one [loss] per check to keep cadence near-real-time
                 if let Some(due) = st.next_due {
-                    if now >= due {
+                    // Grace for loss verdict: interval + baseline + 50ms
+                    let base_ms = st.base_avg.unwrap_or(0.0);
+                    // Round baseline ms up to the nearest ms and add fixed loss slack
+                    let loss_slack_ms = base_ms.ceil() as u64 + LOSS_GRACE_DELAY_MS;
+                    let loss_slack = std::time::Duration::from_millis(loss_slack_ms);
+
+                    // Only declare loss if we're past due + baseline + 50ms
+                    if now >= due + loss_slack {
                         let mut alarm_suffixes: Vec<&str> = Vec::new();
                         alarm_suffixes.push("ALARM_RTT");
                         st.consec_alarm_rtt += 1;
@@ -552,7 +561,7 @@ fn run_server_monitored(
                             ),
                         );
 
-                        // advance exactly one tick; next check will emit the next one if still overdue
+                        // advance exactly one expected tick (grace is only for the check, not the schedule)
                         st.next_due = Some(due + learnt);
                     }
                 }
