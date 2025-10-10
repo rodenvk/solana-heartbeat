@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write, Read};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 
 use byteorder::{ByteOrder, LittleEndian};
 use clap::Parser;
 use chrono::Utc;
+
+mod vote_state;
 
 const MAGIC: u32 = 0x534C_5550; // 'SLUP'
 const VERSION: u32 = 3;         // v3 adds client+version strings to the packet
@@ -17,7 +18,6 @@ const HEADER_MIN: usize = 4 + 4 + 8 + 8 + 2 + 2 + 2 + 2; // minimal header with 
 const DEFAULT_PAYLOAD: usize = 1228;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 const PROBE_SAMPLES: usize = 10; // baseline window size
-const MASTER_WINDOW: Duration = Duration::from_millis(500); // tower mtime freshness
 // Client-side grace thresholds
 const CLIENT_WARN_ABS_MARGIN_MS: f64 = 30.0;  // warn requires at least +30ms over baseline AND 1.5x baseline
 // Server-side grace thresholds
@@ -220,40 +220,6 @@ fn err_line(w: &mut Option<BufWriter<File>>, line: &str) {
     } else {
         eprintln!("{}", line);
     }
-}
-
-// role detection via tower file path (unchanged helpers from your codebase)
-
-fn find_latest_tower(ledger_dir: &Path, pubkey: &str) -> Option<PathBuf> {
-    let needle = format!("-{}.bin", pubkey);
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    let rd = std::fs::read_dir(ledger_dir).ok()?;
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if !p.is_file() { continue; }
-        let name = match p.file_name().and_then(|s| s.to_str()) { Some(s) => s, None => continue };
-        if !name.starts_with("tower-") || !name.ends_with(&needle) { continue; }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(mtime) = meta.modified() {
-                match &best {
-                    Some((best_time, _)) if mtime <= *best_time => {},
-                    _ => best = Some((mtime, p.clone())),
-                }
-            }
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
-fn role_from_tower(ledger: Option<&str>, pubkey: Option<&str>) -> &'static str {
-    let (Some(ledger_dir), Some(pk)) = (ledger, pubkey) else { return "unknown"; };
-    let p = Path::new(ledger_dir);
-    if !p.is_dir() { return "unknown"; }
-    let Some(tower_path) = find_latest_tower(p, pk) else { return "backup"; };
-    let Ok(meta) = std::fs::metadata(&tower_path) else { return "backup"; };
-    let Ok(mtime) = meta.modified() else { return "backup"; };
-    let Ok(age) = SystemTime::now().duration_since(mtime) else { return "master"; };
-    if age <= MASTER_WINDOW { "master" } else { "backup" }
 }
 
 // -----------------------------------------------------------------------------
@@ -795,7 +761,14 @@ fn run_client(
 
             // Prepare NEXT tick and send
             seq += 1;
-            role = role_from_tower(ledger.as_deref(), pubkey.as_deref());
+            
+            let vote_state = vote_state::vote_state_from_tower(ledger.as_deref(), pubkey.as_deref());
+            role = match vote_state {
+                "voting" => "master",
+                "non-voting" => "backup",
+                _ => "unknown",
+            };
+
             let (cn, cv) = detect_client_and_version();
             client_name = cn;
             client_ver = cv;
