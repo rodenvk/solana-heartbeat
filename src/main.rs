@@ -18,9 +18,11 @@ const DEFAULT_PAYLOAD: usize = 1228;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 const PROBE_SAMPLES: usize = 10; // baseline window size
 const MASTER_WINDOW: Duration = Duration::from_millis(500); // tower mtime freshness
+// Client-side grace thresholds
+const CLIENT_WARN_ABS_MARGIN_MS: f64 = 30.0;  // warn requires at least +30ms over baseline AND 1.5x baseline
 // Server-side grace thresholds
-const WARN_ABSOLUTE_DELAY_MS: f64 = 10.0;  // warn requires at least +10ms over baseline AND 1.5x baseline
-const LOSS_GRACE_DELAY_MS: u64 = 50;  // loss when elapsed >= interval + baseline + 50ms
+const SERVER_WARN_ABS_MARGIN_MS: f64 = 25.0;  // warn requires at least +30ms over baseline AND 1.5x baseline
+const SERVER_LOSS_GRACE_DELAY_MS: u64 = 80;  // loss when elapsed >= interval + baseline + 50ms
 
 #[derive(Parser, Debug)]
 #[command(author, version, about="IPv4 UDP heartbeat with Solana-like payload (client/server; mirrored output)")]
@@ -481,7 +483,7 @@ fn run_server_monitored(
 
                         // When we *did* receive a packet, it's either [ok] or [warn] that requires BOTH an absolute bump (+10ms) AND ≥ 1.5× baseline
                         let warn_due_to_baseline = match st.base_avg {
-                            Some(avg) => (delay_ms - avg) >= WARN_ABSOLUTE_DELAY_MS && delay_ms >= avg * 1.5,
+                            Some(avg) => (delay_ms - avg) >= SERVER_WARN_ABS_MARGIN_MS && delay_ms >= avg * 1.5,
                             None => false, // baseline not ready => don't warn yet
                         };
                         let status_label = if warn_due_to_baseline { "[warn]" } else { "[ok]" };
@@ -536,7 +538,7 @@ fn run_server_monitored(
                     // Grace for loss verdict: interval + baseline + 50ms
                     let base_ms = st.base_avg.unwrap_or(0.0);
                     // Round baseline ms up to the nearest ms and add fixed loss slack
-                    let loss_slack_ms = base_ms.ceil() as u64 + LOSS_GRACE_DELAY_MS;
+                    let loss_slack_ms = base_ms.ceil() as u64 + SERVER_LOSS_GRACE_DELAY_MS;
                     let loss_slack = std::time::Duration::from_millis(loss_slack_ms);
 
                     // Only declare loss if we're past due + baseline + 50ms
@@ -724,16 +726,27 @@ fn run_client(
                     "[loss]"
                 } else if servers.len() == 1 {
                     if let (Some(avg), Some(curr)) = (base_avg[0], rtts[0]) {
-                        if curr >= avg * 1.5 { "[warn]" } else { "[ok]" }
+                        if (curr - avg) >= CLIENT_WARN_ABS_MARGIN_MS && curr >= avg * 1.5 {
+                            "[warn]"
+                        } else {
+                            "[ok]"
+                        }
                     } else {
+                        // baseline not ready or missing RTT -> treat as ok here (timeouts become all_missed above)
                         "[ok]"
                     }
                 } else {
-                    // Count "bad" servers: timeout OR (baseline ready AND rtt >= 1.5× baseline)
+                    // Count "bad" servers: timeout OR (baseline ready AND (curr-avg) >= abs margin AND curr >= 1.5×avg)
                     let bads = servers.iter().enumerate().filter(|(i, _)| {
                         match rtts[*i] {
                             None => true, // timeout is bad
-                            Some(curr) => base_avg[*i].map_or(false, |avg| curr >= avg * 1.5),
+                            Some(curr) => {
+                                if let Some(avg) = base_avg[*i] {
+                                    (curr - avg) >= CLIENT_WARN_ABS_MARGIN_MS && curr >= avg * 1.5
+                                } else {
+                                    false // no baseline yet -> don't mark bad on RTT alone
+                                }
+                            }
                         }
                     }).count();
 
