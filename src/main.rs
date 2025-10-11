@@ -640,7 +640,7 @@ fn run_client(
     let mut consec_alarm_rtt: u64 = 0;
 
     // tick context (recomputed each send)
-    let role: &'static str = "unknown";
+    let mut role_for_last_tick: &'static str = "unknown";
     let mut client_name = String::new();
     let mut client_ver = String::new();
 
@@ -754,14 +754,14 @@ fn run_client(
                     &mut writer,
                     &format!(
                         "{}\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms={}{}",
-                        status_label, ts_now(), hostname, role, client_name, client_ver, rtt_str, alarm_str
+                        status_label, ts_now(), hostname, role_for_last_tick, client_name, client_ver, rtt_str, alarm_str
                     ),
                 );
             }
 
             // Prepare NEXT tick and send
             seq += 1;
-            
+
             let (cn, cv) = detect_client_and_version();
             client_name = cn;
             client_ver = cv;
@@ -782,6 +782,9 @@ fn run_client(
                 pubkey.as_deref(),
                 vote_state,
             );
+
+            // Store role to be printed on the next finalize (previous-tick line)
+            role_for_last_tick = role;
 
             let n = encode_packet(&mut tx, &hostname, role, &client_name, &client_ver, seq);
             for (_, addr) in &servers {
