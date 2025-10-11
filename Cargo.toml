@@ -8,3 +8,4 @@ clap = { version = "4.5", features = ["derive"] }
 hostname = "0.4"
 byteorder = "1.5"
 chrono = { version = "0.4", features = ["clock"] }
+ureq = { version = "2.9", features = ["json"] }

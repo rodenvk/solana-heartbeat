@@ -9,7 +9,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use clap::Parser;
 use chrono::Utc;
 
-mod vote_state;
+mod client_checks;
 
 const MAGIC: u32 = 0x534C_5550; // 'SLUP'
 const VERSION: u32 = 3;         // v3 adds client+version strings to the packet
@@ -762,16 +762,26 @@ fn run_client(
             // Prepare NEXT tick and send
             seq += 1;
             
-            let vote_state = vote_state::vote_state_from_tower(ledger.as_deref(), pubkey.as_deref());
-            role = match vote_state {
-                "voting" => "master",
-                "non-voting" => "backup",
-                _ => "unknown",
-            };
-
             let (cn, cv) = detect_client_and_version();
             client_name = cn;
             client_ver = cv;
+
+            let vote_state = client_checks::vote_state_from_tower(ledger.as_deref(), pubkey.as_deref());
+
+            let client_running = client_name != "not running";
+            // If validator client is running, we make a RPC call locally to get the Identity
+            let local_identity = if client_running {
+                client_checks::local_identity("http://127.0.0.1:8899")
+            } else {
+                None
+            };
+
+            let role = client_checks::derive_role(
+                client_running,
+                local_identity.as_deref(),
+                pubkey.as_deref(),
+                vote_state,
+            );
 
             let n = encode_packet(&mut tx, &hostname, role, &client_name, &client_ver, seq);
             for (_, addr) in &servers {
