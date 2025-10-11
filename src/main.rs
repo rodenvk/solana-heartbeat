@@ -640,7 +640,7 @@ fn run_client(
     let mut consec_alarm_rtt: u64 = 0;
 
     // tick context (recomputed each send)
-    let mut role: &'static str = "unknown";
+    let role: &'static str = "unknown";
     let mut client_name = String::new();
     let mut client_ver = String::new();
 
