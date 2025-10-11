@@ -145,9 +145,9 @@ fn get_str<'a>(buf: &'a [u8], off: &mut usize) -> Option<&'a str> {
 fn encode_packet(
     buf: &mut [u8],
     hostname: &str,
+    role: &str,
     client: &str,
     version: &str,
-    role: &str,
     seq: u64,
 ) -> usize {
     let mut off = 0;
@@ -157,9 +157,9 @@ fn encode_packet(
     LittleEndian::write_i64(&mut buf[off..off + 8], now_unix_ns()); off += 8;
 
     put_str(buf, &mut off, hostname);
+    put_str(buf, &mut off, role);
     put_str(buf, &mut off, client);
     put_str(buf, &mut off, version);
-    put_str(buf, &mut off, role);
 
     for b in &mut buf[off..] { *b = 0; }
     buf.len()
@@ -176,11 +176,11 @@ fn decode_packet(buf: &[u8]) -> Option<(u64, i64, String, String, String, String
     let send_ns = LittleEndian::read_i64(&buf[off..off + 8]); off += 8;
 
     let host = get_str(buf, &mut off)?.to_string();
+    let role = get_str(buf, &mut off)?.to_string();
     let client = get_str(buf, &mut off)?.to_string();
     let ver = get_str(buf, &mut off)?.to_string();
-    let role = get_str(buf, &mut off)?.to_string();
 
-    Some((seq, send_ns, host, client, ver, role))
+    Some((seq, send_ns, host, role, client, ver))
 }
 
 // -----------------------------------------------------------------------------
@@ -356,9 +356,9 @@ struct HostState {
     base_avg: Option<f64>,
     consec_alarm_rtt: u64,
     last_seen: Option<std::time::Instant>,
+    last_role: String,
     last_client: String,
     last_version: String,
-    last_role: String,
     // Learned receive interval (probe-based)
     recv_interval_sum: std::time::Duration,        // sum of inter-arrival
     recv_interval_cnt: usize,                      // # of samples
@@ -402,7 +402,7 @@ fn run_server_monitored(
             match sock.recv_from(&mut buf) {
                 Ok((n, peer)) => {
                     let recv_ns = now_unix_ns();
-                    if let Some((_seq, send_ns, host, client, version, role)) = decode_packet(&buf[..n]) {
+                    if let Some((_seq, send_ns, host, role, client, version)) = decode_packet(&buf[..n]) {
                         let st = states.entry(host.clone()).or_default();
 
                         // ---- receive instant (monotonic) ----
@@ -427,9 +427,9 @@ fn run_server_monitored(
                         st.next_due = Some(recv_time + learnt);
 
                         // Update last-known meta from packet
+                        st.last_role = role.clone();
                         st.last_client = client.clone();
                         st.last_version = version.clone();
-                        st.last_role = role.clone();
 
                         // one-way delay (approx) from client timestamp to server receive
                         let mut delay_ms = diff_ms(recv_ns, send_ns);
@@ -474,8 +474,8 @@ fn run_server_monitored(
                         out_line(
                             &mut writer,
                             &format!(
-                                "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={:.2}{}",
-                                status_label, ts_now(), host, st.last_client, st.last_version, st.last_role, delay_ms, alarm_str
+                                "{}\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms={:.2}{}",
+                                status_label, ts_now(), host, st.last_role, st.last_client, st.last_version, delay_ms, alarm_str
                             ),
                         );
                     }
@@ -524,8 +524,8 @@ fn run_server_monitored(
                         out_line(
                             &mut writer,
                             &format!(
-                                "[loss]\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms=timeout{}",
-                                ts_now(), host, st.last_client, st.last_version, st.last_role, alarm_str
+                                "[loss]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms=timeout{}",
+                                ts_now(), host, st.last_role, st.last_client, st.last_version, alarm_str
                             ),
                         );
 
@@ -753,8 +753,8 @@ fn run_client(
                 out_line(
                     &mut writer,
                     &format!(
-                        "{}\t{}\thost={}\tclient=\"{}\"\tversion=\"{}\"\trole={}\trtt_ms={}{}",
-                        status_label, ts_now(), hostname, client_name, client_ver, role, rtt_str, alarm_str
+                        "{}\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms={}{}",
+                        status_label, ts_now(), hostname, role, client_name, client_ver, rtt_str, alarm_str
                     ),
                 );
             }

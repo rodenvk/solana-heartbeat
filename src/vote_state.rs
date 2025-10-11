@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 // How recent the tower file must be to consider the node as voting.
-const MASTER_WINDOW: Duration = Duration::from_millis(800);
+const MASTER_WINDOW: Duration = Duration::from_millis(1000);
 
 pub fn find_latest_tower(ledger_dir: &Path, pubkey: &str) -> Option<PathBuf> {
     let needle = format!("-{}.bin", pubkey);
