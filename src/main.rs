@@ -44,7 +44,7 @@ enum Mode {
         #[arg(long)]
         server: String,
 
-        /// Local bind address (e.g. 0.0.0.0:0)
+        /// Bind address for the client UDP socket (e.g. 0.0.0.0:0)
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: String,
 
@@ -57,11 +57,11 @@ enum Mode {
         timeout_ms: u64,
 
         /// RTT alarm threshold in ms (ALARM_RTT if a numeric RTT exceeds this)
-        #[arg(long = "rtt-alarm-ms", default_value = "150")]
+        #[arg(long = "rtt-alarm-ms", default_value = "400")]
         rtt_alarm_ms: u64,
 
         /// Raise LOSS after this many consecutive alarm ticks
-        #[arg(long = "loss-alarm", default_value = "5")]
+        #[arg(long = "loss-alarm", default_value = "10")]
         loss_alarm: u64,
 
         /// UDP payload size (bytes)
@@ -80,18 +80,18 @@ enum Mode {
         #[arg(long)]
         hostname: Option<String>,
 
-        /// Log file path (optional)
+        /// Optional log file path (append)
         #[arg(long)]
         log: Option<String>,
     },
 
-    /// Server: receive heartbeats and assess health
+    /// Server: listen for heartbeats and echo packets back
     Server {
-        /// Bind address, e.g. 0.0.0.0:7071
-        #[arg(long, default_value = "0.0.0.0:7071")]
+        /// Bind address for the server (e.g. 0.0.0.0:7000)
+        #[arg(long, default_value = "0.0.0.0:7000")]
         bind: String,
 
-        /// Expected client send interval (ms) – informational
+        /// Expected send interval from clients in ms (for information)
         #[arg(long = "interval-ms", default_value = "500")]
         interval_ms: u64,
 
@@ -100,11 +100,11 @@ enum Mode {
         timeout_ms: u64,
 
         /// ALARM_RTT if derived full RTT (prev_recv_ns - prev_send_ns) is above this (ms)
-        #[arg(long = "rtt-alarm-ms", default_value = "150")]
+        #[arg(long = "rtt-alarm-ms", default_value = "400")]
         rtt_alarm_ms: u64,
 
         /// After this many consecutive alarm ticks, emit loss
-        #[arg(long = "loss-alarm", default_value = "5")]
+        #[arg(long = "loss-alarm", default_value = "10")]
         loss_alarm: u64,
 
         /// Log file path (optional)
@@ -114,14 +114,67 @@ enum Mode {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about="solana-heartbeat (client/server)")]
-struct Cli {
+#[command(author, version, about="solana-heartbeat wrapper")]
+struct Args {
     #[command(subcommand)]
     mode: Mode,
 }
 
 /* -------------------------------------------------------------------------- */
-/*                               Small utilities                               */
+/*                                   State                                     */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Default, Clone)]
+struct UpstreamState {
+    // last recv for echo (numeric RTT)
+    last_recv_ns: i64,
+
+    // Consecutive per-upstream ALARM_RTT counter
+    consec_alarm_rtt: u64,
+}
+
+struct HostState {
+    // Baseline probe
+    base_sum: f64,
+    base_cnt: usize,
+    base_avg: Option<f64>,
+
+    // For seq-1 RTT: prev_send_ns from the last packet
+    prev_send_ns: Option<i64>,
+    prev_recv_ns_seen: Option<i64>,
+
+    // Consecutive ALARM_RTT counter
+    consec_alarm_rtt: u64,
+
+    // Last metadata
+    last_role: String,
+    last_client: String,
+    last_version: String,
+
+    // Housekeeping
+    last_seen: Instant,
+    last_seq: u64,
+}
+impl Default for HostState {
+    fn default() -> Self {
+        Self {
+            base_sum: 0.0,
+            base_cnt: 0,
+            base_avg: None,
+            prev_send_ns: None,
+            prev_recv_ns_seen: None,
+            consec_alarm_rtt: 0,
+            last_role: String::new(),
+            last_client: String::new(),
+            last_version: String::new(),
+            last_seen: Instant::now(),
+            last_seq: 0,
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Helpers / utils                               */
 /* -------------------------------------------------------------------------- */
 
 fn now_unix_ns() -> i64 {
@@ -159,17 +212,12 @@ fn out_line(w: &mut Option<BufWriter<File>>, s: &str) {
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/*                             Encode / decode v4                              */
-/* -------------------------------------------------------------------------- */
-
 fn put_str(buf: &mut [u8], off: &mut usize, s: &str) {
-    let bytes = s.as_bytes();
-    let len = bytes.len().min(65535);
-    LittleEndian::write_u16(&mut buf[*off..*off + 2], len as u16);
+    let b = s.as_bytes();
+    LittleEndian::write_u16(&mut buf[*off..*off + 2], b.len() as u16);
     *off += 2;
-    buf[*off..*off + len].copy_from_slice(&bytes[..len]);
-    *off += len;
+    buf[*off..*off + b.len()].copy_from_slice(b);
+    *off += b.len();
 }
 
 fn get_str<'a>(buf: &'a [u8], off: &mut usize) -> Option<&'a str> {
@@ -177,20 +225,19 @@ fn get_str<'a>(buf: &'a [u8], off: &mut usize) -> Option<&'a str> {
     let len = LittleEndian::read_u16(&buf[*off..*off + 2]) as usize;
     *off += 2;
     if *off + len > buf.len() { return None; }
-    let s = std::str::from_utf8(&buf[*off..*off + len]).ok()?;
-    *off += len;
-    Some(s)
+    std::str::from_utf8(&buf[*off..*off + len]).ok().map(|s| { *off += len; s })
 }
 
 fn encode_packet(
-    buf: &mut [u8],
-    hostname: &str,
-    role: &str,
-    client: &str,
-    version_str: &str,
     seq: u64,
     send_ns: i64,
     prev_recv_ns: i64,
+    host: &str,
+    role: &str,
+    client: &str,
+    version_str: &str,
+    payload: usize,
+    buf: &mut [u8],
 ) -> usize {
     let mut off = 0;
     LittleEndian::write_u32(&mut buf[off..off + 4], MAGIC); off += 4;
@@ -199,7 +246,10 @@ fn encode_packet(
     LittleEndian::write_i64(&mut buf[off..off + 8], send_ns); off += 8;
     LittleEndian::write_i64(&mut buf[off..off + 8], prev_recv_ns); off += 8;
 
-    put_str(buf, &mut off, hostname);
+    let pkt_min = HEADER_MIN + payload;
+    if buf.len() < pkt_min { panic!("payload too big (max {})", MAX_UDP_PAYLOAD - HEADER_MIN); }
+
+    put_str(buf, &mut off, host);
     put_str(buf, &mut off, role);
     put_str(buf, &mut off, client);
     put_str(buf, &mut off, version_str);
@@ -231,14 +281,8 @@ fn decode_packet(buf: &[u8]) -> Option<(u32, u64, i64, i64, String, String, Stri
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                    Client                                   */
+/*                                   Client                                    */
 /* -------------------------------------------------------------------------- */
-
-#[derive(Default, Clone)]
-struct UpstreamState {
-    last_recv_ns: i64, // 0 when none yet
-    consec_alarm_rtt: u64,
-}
 
 fn run_client(
     servers_csv: &str,
@@ -248,19 +292,14 @@ fn run_client(
     rtt_alarm: Duration,
     loss_alarm: u64,
     payload: usize,
-    log_path: Option<String>,
     pubkey: Option<String>,
-    _ledger: Option<String>,
+    ledger: Option<String>,
     hostname_override: Option<String>,
+    log_path: Option<String>,
 ) -> Result<(), String> {
-    if payload < HEADER_MIN || payload > MAX_UDP_PAYLOAD {
-        return Err(format!("payload-size must be between {} and {}", HEADER_MIN, MAX_UDP_PAYLOAD));
-    }
-
-    let parts: Vec<&str> = servers_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() || parts.len() > 2 {
-        return Err("provide 1 or 2 servers separated by a comma".into());
-    }
+    // Resolve servers
+    let parts: Vec<_> = servers_csv.split(',').map(|s| s.trim()).collect();
+    if parts.is_empty() { return Err("no servers provided".into()); }
     let servers: Vec<SocketAddr> = parts.iter().map(|p| resolve_ipv4(*p)).collect::<Result<_,_>>()?;
 
     let bind_addr = resolve_ipv4(bind)?;
@@ -269,7 +308,7 @@ fn run_client(
 
     // Node role/client/version via client_checks.rs
     let (client_name, client_ver) = client_checks::detect_client_and_version();
-    let vote_state = client_checks::vote_state_from_tower(None, pubkey.as_deref());
+    let vote_state = client_checks::vote_state_from_tower(ledger.as_deref(), pubkey.as_deref());
     let id = client_checks::local_identity("http://127.0.0.1:8899");
     let role = client_checks::derive_role(
         client_name != "not running",
@@ -291,40 +330,38 @@ fn run_client(
     } else { None };
 
     let mut states = vec![UpstreamState::default(); servers.len()];
+    let mut base_sum = vec![0.0f64; servers.len()];
+    let mut base_cnt = vec![0usize; servers.len()];
+    let mut base_avg = vec![None::<f64>; servers.len()];
+
+    let mut tx = vec![0u8; HEADER_MIN + payload.min(MAX_UDP_PAYLOAD - HEADER_MIN)];
+    let mut rx = vec![0u8; 2048];
+
     let mut seq: u64 = 1;
-    let mut buf = vec![0u8; payload];
-    let mut rx = [0u8; 2048];
-    let mut current_rtts: HashMap<SocketAddr, f64> = HashMap::new();
-
-    // Baseline per server
-    let mut base_sum: Vec<f64> = vec![0.0; servers.len()];
-    let mut base_cnt: Vec<usize> = vec![0; servers.len()];
-    let mut base_avg: Vec<Option<f64>> = vec![None; servers.len()];
-
-    out_line(
-        &mut writer,
-        &format!(
-            "[client]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\tdests={}",
-            ts_now(),
-            hostname,
-            role,
-            client_name,
-            client_ver,
-            servers.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
-        ),
-    );
-
     loop {
         let send_ns = now_unix_ns();
+        let prev_recv_ns = states.iter().map(|s| s.last_recv_ns).max().unwrap_or(0);
 
-        // Send one probe to each server, carrying prev_recv_ns for that server
-        for (i, addr) in servers.iter().enumerate() {
-            let prev_recv_ns = states[i].last_recv_ns;
-            let n = encode_packet(&mut buf, &hostname, &role, &client_name, &client_ver, seq, send_ns, prev_recv_ns);
-            let _ = sock.send_to(&buf[..n], addr);
+        // Build packet (v4 includes prev_recv_ns so server can compute seq-1 RTT)
+        let n = encode_packet(
+            seq,
+            send_ns,
+            prev_recv_ns,
+            &hostname,
+            &role,
+            &client_name,
+            &client_ver,
+            payload.min(MAX_UDP_PAYLOAD - HEADER_MIN),
+            &mut tx,
+        );
+
+        // Send to all servers
+        for addr in &servers {
+            let _ = sock.send_to(&tx[..n], addr);
         }
 
         // Receive echoes until timeout expires (nonblocking, soft loop)
+        let mut current_rtts: HashMap<SocketAddr, f64> = HashMap::new();
         current_rtts.clear();
         let deadline = SystemTime::now() + timeout;
         while SystemTime::now() < deadline {
@@ -352,13 +389,11 @@ fn run_client(
 
         // Build ordered RTTs and decide status with unified WARN grace
         let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
-        let mut any_timeout = false;
         for addr in &servers {
             if let Some(ms) = current_rtts.get(addr) {
                 rtts.push(Some(*ms));
             } else {
                 rtts.push(None);
-                any_timeout = true;
             }
         }
 
@@ -386,27 +421,43 @@ fn run_client(
         }
 
         // Status
-        let status = if any_timeout {
-            "loss"
-        } else if warn_flags.iter().any(|b| *b) {
-            "warn"
+        let status = if servers.len() == 1 {
+            // single server: timeout => loss; else warn via baseline grace
+            if rtts[0].is_none() {
+                "loss"
+            } else if warn_flags[0] {
+                "warn"
+            } else {
+                "ok"
+            }
         } else {
-            "ok"
+            // for more than one server: count bads (timeout OR warn)
+            let mut bads = 0usize;
+            for i in 0..servers.len() {
+                if rtts[i].is_none() || warn_flags[i] { bads += 1; }
+            }
+            match bads {
+                0 => "ok",
+                1 => "warn",
+                _ => "loss",
+            }
         };
 
-        // ALARM_RTT: any timeout OR any numeric rtt > rtt_alarm_ms
-        let mut alarm_rtt = false;
-        for v in &rtts {
-            match v {
-                None => { alarm_rtt = true; }
-                Some(ms) if *ms > rtt_alarm.as_millis() as f64 => { alarm_rtt = true; }
-                _ => {}
-            }
+        // ALARM_RTT: only when *all* servers are bad this tick
+        // A server is "bad" if timeout OR numeric rtt > rtt_alarm_ms
+        let mut per_bad = vec![false; servers.len()];
+        let mut all_bad = !servers.is_empty();
+        for (i, v) in rtts.iter().enumerate() {
+            per_bad[i] = match v {
+                None => true,
+                Some(ms) => *ms > rtt_alarm.as_millis() as f64,
+            };
+            if !per_bad[i] { all_bad = false; }
         }
+        let alarm_rtt = all_bad;
         if alarm_rtt {
-            for (i, v) in rtts.iter().enumerate() {
-                let this_alarm = match v { None => true, Some(ms) => *ms > rtt_alarm.as_millis() as f64 };
-                if this_alarm { states[i].consec_alarm_rtt += 1; } else { states[i].consec_alarm_rtt = 0; }
+            for (i, bad) in per_bad.iter().enumerate() {
+                if *bad { states[i].consec_alarm_rtt += 1; } else { states[i].consec_alarm_rtt = 0; }
             }
         } else {
             for s in &mut states { s.consec_alarm_rtt = 0; }
@@ -435,51 +486,13 @@ fn run_client(
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                    Server                                   */
+/*                                   Server                                    */
 /* -------------------------------------------------------------------------- */
-
-struct HostState {
-    // Rolling baseline for derived RTT
-    base_sum: f64,
-    base_cnt: usize,
-    base_avg: Option<f64>,
-
-    // previous client's send_ns (for seq-1); used with next packet's prev_recv_ns
-    prev_send_ns: Option<i64>,
-    prev_recv_ns_seen: Option<i64>,
-
-    // Consecutive alarm ticks
-    consec_alarm_rtt: u64,
-
-    // Meta
-    last_role: String,
-    last_client: String,
-    last_version: String,
-
-    // Housekeeping
-    last_seen: Instant,
-}
-impl Default for HostState {
-    fn default() -> Self {
-        Self {
-            base_sum: 0.0,
-            base_cnt: 0,
-            base_avg: None,
-            prev_send_ns: None,
-            prev_recv_ns_seen: None,
-            consec_alarm_rtt: 0,
-            last_role: String::new(),
-            last_client: String::new(),
-            last_version: String::new(),
-            last_seen: Instant::now(),
-        }
-    }
-}
 
 fn run_server(
     bind: &str,
     _interval: Duration,
-    _timeout: Duration,
+    timeout: Duration,
     rtt_alarm: Duration,
     loss_alarm: u64,
     log_path: Option<String>,
@@ -495,27 +508,41 @@ fn run_server(
     } else { None };
 
     out_line(&mut writer, &format!(
-        "[server]\t{}\tbind={}\trtt_alarm={}ms\tloss_alarm={}",
-        ts_now(), bind_addr, rtt_alarm.as_millis(), loss_alarm
+        "[server]\t{}\tbind={}\trtt_alarm_ms={}\tloss_alarm={}\ttimeout_ms={}",
+        ts_now(), bind, rtt_alarm.as_millis(), loss_alarm, timeout.as_millis()
     ));
 
-    let mut states: HashMap<String, HostState> = HashMap::new();
-    let mut buf = vec![0u8; 4096];
+    let mut hosts: HashMap<SocketAddr, HostState> = HashMap::new();
+    let mut buf = vec![0u8; 2048];
 
     loop {
         match sock.recv_from(&mut buf) {
             Ok((nr, peer)) => {
-                if let Some((_ver, _seq, send_ns, prev_recv_ns, host, role, client, verstr)) = decode_packet(&buf[..nr]) {
-                    let st = states.entry(host.clone()).or_insert_with(HostState::default);
+                if let Some((_ver, seq, send_ns, prev_recv_ns, host, role, client, verstr)) = decode_packet(&buf[..nr]) {
+                    let st = hosts.entry(peer).or_default();
 
+                    // Housekeeping
                     st.last_role = role;
                     st.last_client = client;
                     st.last_version = verstr;
                     st.last_seen = Instant::now();
 
+                    // Enforce monotonic sequence numbers: ignore out-of-order/duplicate packets
+                    if seq <= st.last_seq {
+                        // still echo back so client can progress its RTT
+                        let _ = sock.send_to(&buf[..nr], peer);
+                        // log a lightweight line without affecting alarms/baselines
+                        let line = format!(
+                            "[ok]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms=out_of_order",
+                            ts_now(), host, st.last_role, st.last_client, st.last_version
+                        );
+                        out_line(&mut writer, &line);
+                        continue;
+                    }
+
                     // Compute RTT for seq-1 using client wallclock: prev_recv_ns - prev_send_ns
+                    let mut rtt_ms = 0.0f64;
                     let mut have_prev = false;
-                    let mut rtt_ms = 0.0;
                     let mut alarm = false;
 
                     if let Some(prev_send) = st.prev_send_ns {
@@ -539,8 +566,8 @@ fn run_server(
 
                             st.prev_recv_ns_seen = Some(prev_recv_ns);
                         } else {
-                            // no progress -> treat as timeout for the previous tick
-                            alarm = true;
+                            // no progress for previous tick: only alarm if past timeout
+                            if st.last_seen.elapsed() >= timeout { alarm = true; }
                         }
                     } // else bootstrap, no RTT yet
 
@@ -557,7 +584,7 @@ fn run_server(
                             "ok"
                         }
                     } else if st.prev_send_ns.is_some() {
-                        "loss" // expected a prev_recv_ns and didn't get one -> timeout
+                        "ok" // no progress yet within timeout window
                     } else {
                         "ok" // bootstrap
                     };
@@ -583,6 +610,7 @@ fn run_server(
 
                     // Update prev_send_ns with this packet's send_ns for next tick
                     st.prev_send_ns = Some(send_ns);
+                    st.last_seq = seq;
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -598,16 +626,18 @@ fn run_server(
 /* -------------------------------------------------------------------------- */
 
 fn main() {
-    let args = Cli::parse();
+    let args = Args::parse();
     match args.mode {
         Mode::Client {
-            server, bind, interval_ms, timeout_ms, rtt_alarm_ms, loss_alarm, payload, log, pubkey, ledger, hostname
+            server, bind, interval_ms, timeout_ms, rtt_alarm_ms, loss_alarm, payload,
+            pubkey, ledger, hostname, log
         } => {
             let interval = Duration::from_millis(interval_ms);
             let timeout = Duration::from_millis(timeout_ms);
             let rtt_alarm = Duration::from_millis(rtt_alarm_ms);
             if let Err(e) = run_client(
-                &server, &bind, interval, timeout, rtt_alarm, loss_alarm, payload, log, pubkey, ledger, hostname
+                &server, &bind, interval, timeout, rtt_alarm, loss_alarm, payload,
+                pubkey, ledger, hostname, log
             ) {
                 eprintln!("client error: {}", e);
                 std::process::exit(1);
