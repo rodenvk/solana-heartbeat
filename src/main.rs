@@ -459,19 +459,24 @@ fn run_client(
             // Send NEXT packet exactly on schedule
             seq = seq.wrapping_add(1);
             let send_ns = now_unix_ns();
-            let prev_recv_ns = states.iter().map(|s| s.last_recv_ns).max().unwrap_or(0);
-            let n = encode_packet(
-                seq,
-                send_ns,
-                prev_recv_ns,
-                &hostname,
-                &role,
-                &client_name,
-                &client_ver,
-                payload.min(MAX_UDP_PAYLOAD - HEADER_MIN),
-                &mut tx,
-            );
-            for addr in &servers {
+            // IMPORTANT: encode per server so each gets its own prev_recv_ns
+            let payload_len = payload.min(MAX_UDP_PAYLOAD - HEADER_MIN);
+            for (i, addr) in servers.iter().enumerate() {
+                // timestamp for THIS server
+                let per_server_prev_recv_ns = states[i].last_recv_ns;
+
+                let n = encode_packet(
+                    seq,
+                    send_ns,
+                    per_server_prev_recv_ns,
+                    &hostname,
+                    &role,
+                    &client_name,
+                    &client_ver,
+                    payload_len,
+                    &mut tx,
+                );
+
                 let _ = sock.send_to(&tx[..n], addr);
             }
             current_rtts.clear();
