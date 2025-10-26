@@ -26,9 +26,7 @@ const HEADER_MIN: usize = 4 + 4 + 8 + 8 + 8 + 2 + 0 + 2 + 0 + 2 + 0 + 2 + 0;
 const MAX_UDP_PAYLOAD: usize = 1228;
 const PROBE_SAMPLES: usize = 10;
 
-// Grace thresholds (aligned client/server): warn requires BOTH
-//  - absolute +20ms over baseline AND
-//  - >= 1.5x baseline
+// Warn requires BOTH: absolute +20ms AND >= 1.5x baseline
 const WARN_ABS_MARGIN_MS: f64 = 20.0;
 
 /* -------------------------------------------------------------------------- */
@@ -52,7 +50,7 @@ enum Mode {
         #[arg(long = "interval-ms", default_value = "500")]
         interval_ms: u64,
 
-        /// Read timeout in ms
+        /// Read timeout in ms (max wait per seq, but never past the next tick)
         #[arg(long = "timeout-ms", default_value = "1500")]
         timeout_ms: u64,
 
@@ -126,7 +124,7 @@ struct Args {
 
 #[derive(Default, Clone)]
 struct UpstreamState {
-    // last recv for echo (numeric RTT)
+    // last recv for echo (numeric RTT reference for next packet)
     last_recv_ns: i64,
 
     // Consecutive per-upstream ALARM_RTT counter
@@ -337,151 +335,188 @@ fn run_client(
     let mut tx = vec![0u8; HEADER_MIN + payload.min(MAX_UDP_PAYLOAD - HEADER_MIN)];
     let mut rx = vec![0u8; 2048];
 
-    let mut seq: u64 = 1;
+    // Strict cadence: schedule sends and never block past next tick
+    let mut next_send = Instant::now();
+    let mut seq: u64 = 0;
+    let mut current_rtts: HashMap<SocketAddr, f64> = HashMap::new();
+
     loop {
-        let send_ns = now_unix_ns();
-        let prev_recv_ns = states.iter().map(|s| s.last_recv_ns).max().unwrap_or(0);
-
-        // Build packet (v4 includes prev_recv_ns so server can compute seq-1 RTT)
-        let n = encode_packet(
-            seq,
-            send_ns,
-            prev_recv_ns,
-            &hostname,
-            &role,
-            &client_name,
-            &client_ver,
-            payload.min(MAX_UDP_PAYLOAD - HEADER_MIN),
-            &mut tx,
-        );
-
-        // Send to all servers
-        for addr in &servers {
-            let _ = sock.send_to(&tx[..n], addr);
-        }
-
-        // Receive echoes until timeout expires (nonblocking, soft loop)
-        let mut current_rtts: HashMap<SocketAddr, f64> = HashMap::new();
-        current_rtts.clear();
-        let deadline = SystemTime::now() + timeout;
-        while SystemTime::now() < deadline {
+        // (1) Drain any available replies (non-blocking) for the *current* seq
+        loop {
             match sock.recv_from(&mut rx) {
                 Ok((nr, src)) => {
-                    if let Some((_ver, rseq, send_ns_echo, _prev_recv_unused, _h, _r, _c, _v)) = decode_packet(&rx[..nr]) {
+                    if let Some((_ver, rseq, send_ns_echo, _prev_recv_unused, _h, _r, _c, _v)) =
+                        decode_packet(&rx[..nr])
+                    {
+                        // Count replies for current sequence only; ignore late ones
                         if rseq == seq && !current_rtts.contains_key(&src) {
-                            // Log local recv_ns and RTT (timeout fix: numeric always if reply arrived)
                             let recv_ns = now_unix_ns();
                             let rtt = diff_ms(recv_ns, send_ns_echo);
                             current_rtts.insert(src, rtt);
-                            // will ship recv_ns as prev_recv_ns on next tick
                             if let Some(pos) = servers.iter().position(|a| *a == src) {
-                                states[pos].last_recv_ns = recv_ns;
+                                states[pos].last_recv_ns = recv_ns; // for next packet's prev_recv_ns
                             }
                         }
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // drained
+                Err(_) => break,
+            }
+        }
+
+        // (2) Exactly on schedule: finalize previous tick and send next
+        let now = Instant::now();
+        if now >= next_send {
+            // Finalize previous tick (if we already sent at least once)
+            if seq > 0 {
+                // Build ordered RTTs and decide status with unified WARN grace
+                let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
+                for addr in &servers {
+                    rtts.push(current_rtts.get(addr).cloned());
                 }
-                Err(_e) => break,
-            }
-        }
 
-        // Build ordered RTTs and decide status with unified WARN grace
-        let mut rtts: Vec<Option<f64>> = Vec::with_capacity(servers.len());
-        for addr in &servers {
-            if let Some(ms) = current_rtts.get(addr) {
-                rtts.push(Some(*ms));
-            } else {
-                rtts.push(None);
-            }
-        }
-
-        // Update baselines with successful samples
-        for i in 0..servers.len() {
-            if base_avg[i].is_none() {
-                if let Some(ms) = rtts[i] {
-                    base_sum[i] += ms;
-                    base_cnt[i] += 1;
-                    if base_cnt[i] == PROBE_SAMPLES {
-                        base_avg[i] = Some(base_sum[i] / PROBE_SAMPLES as f64);
+                // Update baselines with successful samples
+                for i in 0..servers.len() {
+                    if base_avg[i].is_none() {
+                        if let Some(ms) = rtts[i] {
+                            base_sum[i] += ms;
+                            base_cnt[i] += 1;
+                            if base_cnt[i] == PROBE_SAMPLES {
+                                base_avg[i] = Some(base_sum[i] / PROBE_SAMPLES as f64);
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        // WARN grace check per server
-        let mut warn_flags = vec![false; servers.len()];
-        for i in 0..servers.len() {
-            if let (Some(avg), Some(curr)) = (base_avg[i], rtts[i]) {
-                if (curr - avg) >= WARN_ABS_MARGIN_MS && curr >= avg * 1.5 {
-                    warn_flags[i] = true;
+                // WARN grace check per server
+                let mut warn_flags = vec![false; servers.len()];
+                for i in 0..servers.len() {
+                    if let (Some(avg), Some(curr)) = (base_avg[i], rtts[i]) {
+                        if (curr - avg) >= WARN_ABS_MARGIN_MS && curr >= avg * 1.5 {
+                            warn_flags[i] = true;
+                        }
+                    }
+                }
+
+                // Status
+                let status = if servers.len() == 1 {
+                    if rtts[0].is_none() {
+                        "loss"
+                    } else if warn_flags[0] {
+                        "warn"
+                    } else {
+                        "ok"
+                    }
+                } else {
+                    let mut bads = 0usize;
+                    for i in 0..servers.len() {
+                        if rtts[i].is_none() || warn_flags[i] { bads += 1; }
+                    }
+                    match bads {
+                        0 => "ok",
+                        1 => "warn",
+                        _ => "loss",
+                    }
+                };
+
+                // ALARM_RTT: only when *all* servers are bad this tick
+                let mut per_bad = vec![false; servers.len()];
+                let mut all_bad = !servers.is_empty();
+                for (i, v) in rtts.iter().enumerate() {
+                    per_bad[i] = match v {
+                        None => true,
+                        Some(ms) => *ms > rtt_alarm.as_millis() as f64,
+                    };
+                    if !per_bad[i] { all_bad = false; }
+                }
+                let alarm_rtt = all_bad;
+                if alarm_rtt {
+                    for (i, bad) in per_bad.iter().enumerate() {
+                        if *bad { states[i].consec_alarm_rtt += 1; } else { states[i].consec_alarm_rtt = 0; }
+                    }
+                } else {
+                    for s in &mut states { s.consec_alarm_rtt = 0; }
+                }
+                let loss_escalated = states.iter().all(|s| s.consec_alarm_rtt >= loss_alarm);
+
+                // Print consolidated line
+                let mut line = format!(
+                    "[{}]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms=",
+                    status, ts_now(), hostname, role, client_name, client_ver
+                );
+                for (i, v) in rtts.iter().enumerate() {
+                    if i > 0 { line.push(','); }
+                    match v {
+                        Some(ms) => line.push_str(&format!("{:.2}", ms)),
+                        None => line.push_str("timeout"),
+                    }
+                }
+                if alarm_rtt { line.push_str("  ALARM_RTT"); }
+                if loss_escalated { line.push_str(" ALARM_LOSS"); }
+                out_line(&mut writer, &line);
+            }
+
+            // Send NEXT packet exactly on schedule
+            seq = seq.wrapping_add(1);
+            let send_ns = now_unix_ns();
+            let prev_recv_ns = states.iter().map(|s| s.last_recv_ns).max().unwrap_or(0);
+            let n = encode_packet(
+                seq,
+                send_ns,
+                prev_recv_ns,
+                &hostname,
+                &role,
+                &client_name,
+                &client_ver,
+                payload.min(MAX_UDP_PAYLOAD - HEADER_MIN),
+                &mut tx,
+            );
+            for addr in &servers {
+                let _ = sock.send_to(&tx[..n], addr);
+            }
+            current_rtts.clear();
+
+            // Maintain a steady cadence (avoid drift if we were late)
+            next_send += interval;
+            if Instant::now() > next_send + interval {
+                next_send = Instant::now() + interval;
+            }
+
+            // Receive for *this seq* up to min(timeout, time until next tick).
+            // We always report missing replies as "timeout"
+            let send_instant = Instant::now();
+            let full_timeout_deadline = send_instant + timeout;
+            let recv_deadline = if full_timeout_deadline < next_send {
+                full_timeout_deadline
+            } else {
+                next_send
+            };
+            while Instant::now() < recv_deadline {
+                match sock.recv_from(&mut rx) {
+                    Ok((nr, src)) => {
+                        if let Some((_ver, rseq, send_ns_echo, _prev_recv_unused, _h, _r, _c, _v)) =
+                            decode_packet(&rx[..nr])
+                        {
+                            if rseq == seq && !current_rtts.contains_key(&src) {
+                                let recv_ns = now_unix_ns();
+                                let rtt = diff_ms(recv_ns, send_ns_echo);
+                                current_rtts.insert(src, rtt);
+                                if let Some(pos) = servers.iter().position(|a| *a == src) {
+                                    states[pos].last_recv_ns = recv_ns;
+                                }
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_e) => break,
                 }
             }
         }
 
-        // Status
-        let status = if servers.len() == 1 {
-            // single server: timeout => loss; else warn via baseline grace
-            if rtts[0].is_none() {
-                "loss"
-            } else if warn_flags[0] {
-                "warn"
-            } else {
-                "ok"
-            }
-        } else {
-            // for more than one server: count bads (timeout OR warn)
-            let mut bads = 0usize;
-            for i in 0..servers.len() {
-                if rtts[i].is_none() || warn_flags[i] { bads += 1; }
-            }
-            match bads {
-                0 => "ok",
-                1 => "warn",
-                _ => "loss",
-            }
-        };
-
-        // ALARM_RTT: only when *all* servers are bad this tick
-        // A server is "bad" if timeout OR numeric rtt > rtt_alarm_ms
-        let mut per_bad = vec![false; servers.len()];
-        let mut all_bad = !servers.is_empty();
-        for (i, v) in rtts.iter().enumerate() {
-            per_bad[i] = match v {
-                None => true,
-                Some(ms) => *ms > rtt_alarm.as_millis() as f64,
-            };
-            if !per_bad[i] { all_bad = false; }
-        }
-        let alarm_rtt = all_bad;
-        if alarm_rtt {
-            for (i, bad) in per_bad.iter().enumerate() {
-                if *bad { states[i].consec_alarm_rtt += 1; } else { states[i].consec_alarm_rtt = 0; }
-            }
-        } else {
-            for s in &mut states { s.consec_alarm_rtt = 0; }
-        }
-        let loss_escalated = states.iter().all(|s| s.consec_alarm_rtt >= loss_alarm);
-
-        // Print line (timeout only if truly no reply)
-        let mut line = format!(
-            "[{}]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms=",
-            status, ts_now(), hostname, role, client_name, client_ver
-        );
-        for (i, v) in rtts.iter().enumerate() {
-            if i > 0 { line.push(','); }
-            match v {
-                Some(ms) => line.push_str(&format!("{:.2}", ms)),
-                None => line.push_str("timeout"),
-            }
-        }
-        if alarm_rtt { line.push_str("  ALARM_RTT"); }
-        if loss_escalated { line.push_str(" ALARM_LOSS"); }
-        out_line(&mut writer, &line);
-
-        seq = seq.wrapping_add(1);
-        std::thread::sleep(interval);
+        // (3) Tiny sleep prevents a tight spin
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -521,17 +556,11 @@ fn run_server(
                 if let Some((_ver, seq, send_ns, prev_recv_ns, host, role, client, verstr)) = decode_packet(&buf[..nr]) {
                     let st = hosts.entry(peer).or_default();
 
-                    // Housekeeping
-                    st.last_role = role;
-                    st.last_client = client;
-                    st.last_version = verstr;
-                    st.last_seen = Instant::now();
-
                     // Enforce monotonic sequence numbers: ignore out-of-order/duplicate packets
                     if seq <= st.last_seq {
                         // still echo back so client can progress its RTT
                         let _ = sock.send_to(&buf[..nr], peer);
-                        // log a lightweight line without affecting alarms/baselines
+                        // cheap log
                         let line = format!(
                             "[ok]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms=out_of_order",
                             ts_now(), host, st.last_role, st.last_client, st.last_version
@@ -539,6 +568,12 @@ fn run_server(
                         out_line(&mut writer, &line);
                         continue;
                     }
+
+                    // Housekeeping
+                    st.last_role = role;
+                    st.last_client = client;
+                    st.last_version = verstr;
+                    st.last_seen = Instant::now();
 
                     // Compute RTT for seq-1 using client wallclock: prev_recv_ns - prev_send_ns
                     let mut rtt_ms = 0.0f64;
@@ -608,7 +643,7 @@ fn run_server(
                     // Echo back packet so client can measure its RTT
                     let _ = sock.send_to(&buf[..nr], peer);
 
-                    // Update prev_send_ns with this packet's send_ns for next tick
+                    // Update prev_send_ns with this packet's send_ns for next tick and seq
                     st.prev_send_ns = Some(send_ns);
                     st.last_seq = seq;
                 }
