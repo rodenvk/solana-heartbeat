@@ -145,6 +145,7 @@ struct HostState {
     consec_alarm_rtt: u64,
 
     // Last metadata
+    last_host: String,
     last_role: String,
     last_client: String,
     last_version: String,
@@ -152,6 +153,7 @@ struct HostState {
     // Housekeeping
     last_seen: Instant,
     last_seq: u64,
+    next_emit: Instant,
 }
 impl Default for HostState {
     fn default() -> Self {
@@ -162,11 +164,13 @@ impl Default for HostState {
             prev_send_ns: None,
             prev_recv_ns_seen: None,
             consec_alarm_rtt: 0,
+            last_host: String::new(),
             last_role: String::new(),
             last_client: String::new(),
             last_version: String::new(),
             last_seen: Instant::now(),
             last_seq: 0,
+            next_emit: Instant::now(),
         }
     }
 }
@@ -531,7 +535,7 @@ fn run_client(
 
 fn run_server(
     bind: &str,
-    _interval: Duration,
+    interval: Duration,
     timeout: Duration,
     rtt_alarm: Duration,
     loss_alarm: u64,
@@ -568,17 +572,19 @@ fn run_server(
                         // cheap log
                         let line = format!(
                             "[ok]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms=out_of_order",
-                            ts_now(), host, st.last_role, st.last_client, st.last_version
+                            ts_now(), st.last_host, st.last_role, st.last_client, st.last_version
                         );
                         out_line(&mut writer, &line);
                         continue;
                     }
 
                     // Housekeeping
+                    st.last_host = host.clone();
                     st.last_role = role;
                     st.last_client = client;
                     st.last_version = verstr;
                     st.last_seen = Instant::now();
+                    if st.next_emit < st.last_seen { st.next_emit = st.last_seen + interval; }
 
                     // Compute RTT for seq-1 using client wallclock: prev_recv_ns - prev_send_ns
                     let mut rtt_ms = 0.0f64;
@@ -640,10 +646,14 @@ fn run_server(
 
                     let mut line = format!(
                         "[{}]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms={}",
-                        status, ts_now(), host, st.last_role, st.last_client, st.last_version, rtt_field
+                        status, ts_now(), st.last_host, st.last_role, st.last_client, st.last_version, rtt_field
                     );
                     if alarm { line.push_str("  ALARM_RTT"); }
                     out_line(&mut writer, &line);
+
+                    // Align emissions to interval after a real measurement or timeout
+                    // (the catch-up loop below will fill any missed interval slots)
+                    st.next_emit = Instant::now() + interval;
 
                     // Echo back packet so client can measure its RTT
                     let _ = sock.send_to(&buf[..nr], peer);
@@ -654,6 +664,31 @@ fn run_server(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No packets right now: synthesize per-interval timeouts so server output
+                // mirrors the client's cadence during prolonged ingress failures at the client.
+                let now = Instant::now();
+                for (_addr, st) in hosts.iter_mut() {
+                    // Emit at most a small burst to avoid flooding if server stalled
+                    let mut emits = 0usize;
+                    while now >= st.next_emit && emits < 20 {
+                        // This represents the "previous tick" having no progress
+                        st.consec_alarm_rtt += 1;
+                        let is_loss = st.consec_alarm_rtt >= loss_alarm;
+
+                        let mut line = format!(
+                            "[loss]\t{}\thost={}\trole={}\tclient=\"{}\"\tversion=\"{}\"\trtt_ms={}",
+                            ts_now(), st.last_host, st.last_role, st.last_client, st.last_version, "timeout"
+                        );
+                        line.push_str("  ALARM_RTT");
+                        if is_loss {
+                            line.push_str(" ALARM_LOSS");
+                        }
+                        out_line(&mut writer, &line);
+
+                        st.next_emit += interval;
+                        emits += 1;
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => return Err(format!("recv: {}", e)),
