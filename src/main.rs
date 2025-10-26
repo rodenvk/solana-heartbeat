@@ -593,24 +593,36 @@ fn run_server(
 
                     if let Some(prev_send) = st.prev_send_ns {
                         if prev_recv_ns > 0 && st.prev_recv_ns_seen.map_or(true, |p| prev_recv_ns > p) {
+                            // compute RTT using client wallclock
                             rtt_ms = diff_ms(prev_recv_ns, prev_send);
-                            have_prev = true;
 
-                            // Update baseline on successes
-                            if st.base_avg.is_none() && st.base_cnt < PROBE_SAMPLES {
-                                st.base_sum += rtt_ms;
-                                st.base_cnt += 1;
-                                if st.base_cnt == PROBE_SAMPLES {
-                                    st.base_avg = Some(st.base_sum / PROBE_SAMPLES as f64);
-                                }
-                            }
-
-                            // Immediate alarm if above rtt_alarm
-                            if rtt_ms > rtt_alarm.as_millis() as f64 {
+                            // discard late (post-timeout) measurements — treat as a timeout
+                            let timeout_ms = timeout.as_millis() as f64;
+                            if rtt_ms > timeout_ms {
+                                // do not count as a successful RTT; just raise ALARM_RTT like the client would
+                                have_prev = false;
                                 alarm = true;
-                            }
+                                st.prev_recv_ns_seen = Some(prev_recv_ns);
+                            } else {
+                                // normal successful measurement
+                                have_prev = true;
 
-                            st.prev_recv_ns_seen = Some(prev_recv_ns);
+                                // Update baseline on successes
+                                if st.base_avg.is_none() && st.base_cnt < PROBE_SAMPLES {
+                                    st.base_sum += rtt_ms;
+                                    st.base_cnt += 1;
+                                    if st.base_cnt == PROBE_SAMPLES {
+                                        st.base_avg = Some(st.base_sum / PROBE_SAMPLES as f64);
+                                    }
+                                }
+
+                                // Immediate alarm if above rtt_alarm
+                                if rtt_ms > rtt_alarm.as_millis() as f64 {
+                                    alarm = true;
+                                }
+
+                                st.prev_recv_ns_seen = Some(prev_recv_ns);
+                            }
                         } else {
                             // no progress for previous tick: only alarm if past timeout
                             if st.last_seen.elapsed() >= timeout { alarm = true; }
