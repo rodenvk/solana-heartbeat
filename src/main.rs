@@ -144,6 +144,10 @@ struct HostState {
     // Consecutive ALARM_RTT counter
     consec_alarm_rtt: u64,
 
+    // True if we emitted at least one synthetic timeout since the last real packet.
+    // Used to suppress a single late RTT sample that arrives after timeouts.
+    had_synth_timeout: bool,
+
     // Last metadata
     last_host: String,
     last_role: String,
@@ -164,6 +168,7 @@ impl Default for HostState {
             prev_send_ns: None,
             prev_recv_ns_seen: None,
             consec_alarm_rtt: 0,
+            had_synth_timeout: false,
             last_host: String::new(),
             last_role: String::new(),
             last_client: String::new(),
@@ -591,6 +596,11 @@ fn run_server(
                     let mut have_prev = false;
                     let mut alarm = false;
 
+                    // If we emitted synthetic timeouts since last real packet OR there’s a sequence gap,
+                    // do not consume the carried prev_recv_ns this time — it would be a stale pre-stall RTT.
+                    let seq_gap = seq.saturating_sub(st.last_seq);
+                    let suppress_prev = st.had_synth_timeout || seq_gap > 1;
+
                     if let Some(prev_send) = st.prev_send_ns {
                         if prev_recv_ns > 0 && st.prev_recv_ns_seen.map_or(true, |p| prev_recv_ns > p) {
                             // compute RTT using client wallclock
@@ -628,6 +638,11 @@ fn run_server(
                             if st.last_seen.elapsed() >= timeout { alarm = true; }
                         }
                     } // else bootstrap, no RTT yet
+
+                    // We’ve consumed (or intentionally skipped) the stale prev once — clear the flag.
+                    if suppress_prev {
+                        st.had_synth_timeout = false;
+                    }
 
                     if alarm { st.consec_alarm_rtt += 1; } else { st.consec_alarm_rtt = 0; }
                     let is_loss = st.consec_alarm_rtt >= loss_alarm;
@@ -683,6 +698,9 @@ fn run_server(
                     // Emit at most a small burst to avoid flooding if server stalled
                     let mut emits = 0usize;
                     while now >= st.next_emit && emits < 20 {
+                        // We’re synthesizing a timeout for this peer.
+                        st.had_synth_timeout = true;
+                        
                         // This represents the "previous tick" having no progress
                         st.consec_alarm_rtt += 1;
                         let is_loss = st.consec_alarm_rtt >= loss_alarm;
